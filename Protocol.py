@@ -1,7 +1,11 @@
 import wmi
 import time
 import random
+import socket
+import ssl
+from paramiko import SSHClient, AutoAddPolicy, RSAKey
 
+# Function to create a virtual machine
 def create_virtual_machine(name, memory_mb, vhd_path, iso_path):
     conn = wmi.WMI(namespace="root/virtualization/v2")
 
@@ -42,8 +46,8 @@ def create_virtual_machine(name, memory_mb, vhd_path, iso_path):
         raise Exception("Failed to create virtual machine")
 
     print(f"Virtual machine '{name}' created successfully!")
-    
 
+# Function to get the IP address of a virtual machine
 def get_vm_ip_address(vm_name):
     conn = wmi.WMI(namespace="root/virtualization/v2")
     
@@ -76,44 +80,43 @@ def get_vm_ip_address(vm_name):
 
     return None
 
-import socket
-
+# Function to get the local IP address
 def get_local_ip():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
     try:
         sock.connect(("8.8.8.8", 80))
-
         local_ip = sock.getsockname()[0]
     finally:
         sock.close()
     
     return local_ip
-    
-from paramiko import SSHClient, AutoAddPolicy
 
-def ssh_connect(ip_address, username, password, command):
+# Function to connect to a VM via SSH using a key file
+def ssh_connect(ip_address, username, key_path, command):
     try:
-        # ایجاد اتصال SSH
         ssh = SSHClient()
         ssh.set_missing_host_key_policy(AutoAddPolicy())
-        ssh.connect(ip_address, username=username, password=password)
+        
+        key = RSAKey.from_private_key_file(key_path)
+        ssh.connect(ip_address, username=username, pkey=key)
 
-        # اجرای یک فرمان
         stdin, stdout, stderr = ssh.exec_command(command)
         print("Output:", stdout.read().decode())
         print("Errors:", stderr.read().decode())
 
-        # بستن اتصال
         ssh.close()
 
     except Exception as e:
         print(f"Error connecting to {ip_address}: {e}")
 
-def install_tor_on_vm(ip, username, password):
+# Function to install Tor on a VM
+def install_tor_on_vm(ip, username, key_path):
     client = SSHClient()
     client.set_missing_host_key_policy(AutoAddPolicy())
-    client.connect(ip, username=username, password=password)
+    
+    key = RSAKey.from_private_key_file(key_path)
+    client.connect(ip, username=username, pkey=key)
 
     commands = [
         "sudo apt-get update",
@@ -128,14 +131,14 @@ def install_tor_on_vm(ip, username, password):
 
     client.close()
 
-import paramiko
-
-def setup_port_forwarding(ip_address, username, password, host_ip):
+# Function to set up port forwarding on a VM
+def setup_port_forwarding(ip_address, username, key_path, host_ip):
     try:
-
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip_address, username=username, password=password)
+        ssh = SSHClient()
+        ssh.set_missing_host_key_policy(AutoAddPolicy())
+        
+        key = RSAKey.from_private_key_file(key_path)
+        ssh.connect(ip_address, username=username, pkey=key)
 
         commands = [
             f"sudo iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination {host_ip}:80",
@@ -155,9 +158,7 @@ def setup_port_forwarding(ip_address, username, password, host_ip):
     except Exception as e:
         print(f"Error setting up port forwarding: {e}")
 
-import socket
-import ssl
-
+# Function to create an SSL connection
 def create_ssl_connection(host, port):
     context = ssl.create_default_context()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -165,6 +166,7 @@ def create_ssl_connection(host, port):
     ssl_sock.connect((host, port))
     return ssl_sock
 
+# Function to send a request through a chain of proxies
 def send_request(proxy_list, target_host, target_port, request):
     for proxy in proxy_list:
         print(f"Connecting to proxy: {proxy['host']}:{proxy['port']}")
@@ -179,11 +181,12 @@ def main():
         user = input("IAP> ")
         if user == "enable":
             print("ENABLING : Creating VMs...")
+            # Create 15 virtual machines
             for i in range(1, 16):
                 create_virtual_machine(f"VM{i}", 2048, f"./VM{i}.vhdx", "./ubuntu-24.04.1-live-server-amd64.iso")
                 print(f"Created VM{i}")
                 
-            print("ENABLING : Getting Vm's IPs...")
+            print("ENABLING : Getting VMs' IPs...")
             ips = {}
             for j in range(1, 16):
                 ip = get_vm_ip_address(f"VM{j}")
@@ -192,16 +195,17 @@ def main():
             print("ENABLING : Doing SSH on VMs and installing Tor on them")
             time.sleep(0.4)
             username = "username"
-            password = "password"
+            key_path = "/path/to/private/key"
             print(f"Doing SSH to VMs...")
             for ip, vm in ips.items():
-                install_tor_on_vm(ip, username, password)
+                install_tor_on_vm(ip, username, key_path)
                 
             print("ENABLING : Creating Orwell router...")
-            router_ip = random.choice(ips)
-            ssh_connect(router_ip, username, password, "sudo apt-get update && sudo apt-get install -y frr && sudo systemctl enable frr && sudo systemctl start frr")
+            router_ip = random.choice(list(ips.keys()))
+            ssh_connect(router_ip, username, key_path, "sudo apt-get update && sudo apt-get install -y frr && sudo systemctl enable frr && sudo systemctl start frr")
             time.sleep(0.5)
             print("ENABLING : Setting up port forwarding...")
-            setup_port_forwarding(router_ip, username, password, get_local_ip())
-            
-            
+            setup_port_forwarding(router_ip, username, key_path, get_local_ip())
+
+if __name__ == "__main__":
+    main()
