@@ -3,7 +3,7 @@ import time
 import random
 import socket
 import ssl
-from paramiko import SSHClient, AutoAddPolicy, RSAKey
+from paramiko import SSHClient, AutoAddPolicy
 
 # Function to create a virtual machine
 def create_virtual_machine(name, memory_mb, vhd_path, iso_path):
@@ -93,13 +93,12 @@ def get_local_ip():
     return local_ip
 
 # Function to connect to a VM via SSH using a key file
-def ssh_connect(ip_address, username, key_path, command):
+def ssh_connect(ip_address, username, password, command):
     try:
         ssh = SSHClient()
         ssh.set_missing_host_key_policy(AutoAddPolicy())
         
-        key = RSAKey.from_private_key_file(key_path)
-        ssh.connect(ip_address, username=username, pkey=key)
+        ssh.connect(ip_address, username=username, password=password)
 
         stdin, stdout, stderr = ssh.exec_command(command)
         print("Output:", stdout.read().decode())
@@ -111,12 +110,11 @@ def ssh_connect(ip_address, username, key_path, command):
         print(f"Error connecting to {ip_address}: {e}")
 
 # Function to install Tor on a VM
-def install_tor_on_vm(ip, username, key_path):
+def install_tor_on_vm(ip, username, password):
     client = SSHClient()
     client.set_missing_host_key_policy(AutoAddPolicy())
-    
-    key = RSAKey.from_private_key_file(key_path)
-    client.connect(ip, username=username, pkey=key)
+    client.connect(ip, username=username, password=password)
+
 
     commands = [
         "sudo apt-get update",
@@ -132,13 +130,11 @@ def install_tor_on_vm(ip, username, key_path):
     client.close()
 
 # Function to set up port forwarding on a VM
-def setup_port_forwarding(ip_address, username, key_path, host_ip):
+def setup_port_forwarding(ip_address, username, password, host_ip):
     try:
         ssh = SSHClient()
         ssh.set_missing_host_key_policy(AutoAddPolicy())
-        
-        key = RSAKey.from_private_key_file(key_path)
-        ssh.connect(ip_address, username=username, pkey=key)
+        ssh.connect(ip_address, username=username, password=password)
 
         commands = [
             f"sudo iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination {host_ip}:80",
@@ -195,17 +191,17 @@ def main():
             print("ENABLING : Doing SSH on VMs and installing Tor on them")
             time.sleep(0.4)
             username = "username"
-            key_path = "/path/to/private/key"
+            password = "password"
             print(f"Doing SSH to VMs...")
             for ip, vm in ips.items():
-                install_tor_on_vm(ip, username, key_path)
+                install_tor_on_vm(ip, username, password)
                 
             print("ENABLING : Creating Orwell router...")
             router_ip = random.choice(list(ips.keys()))
-            ssh_connect(router_ip, username, key_path, "sudo apt-get update && sudo apt-get install -y frr && sudo systemctl enable frr && sudo systemctl start frr")
+            ssh_connect(router_ip, username, password, "sudo apt-get update && sudo apt-get install -y frr && sudo systemctl enable frr && sudo systemctl start frr")
             time.sleep(0.5)
             print("ENABLING : Setting up port forwarding...")
-            setup_port_forwarding(router_ip, username, key_path, get_local_ip())
+            setup_port_forwarding(router_ip, username, password, get_local_ip())
 
 if __name__ == "__main__":
     main()
