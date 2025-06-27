@@ -7,7 +7,8 @@ Bypass Iran/China and similar censorship with:
 - DNS over HTTPS
 - TLS camouflage
 - Pluggable, easy to extend with new bypass modules
-- Remote config support (bridges, DoH, fronting, meek)
+- All config via CLI
+- Native Tor (PySocks) support
 """
 
 import os
@@ -24,9 +25,9 @@ import ssl
 import base64
 import requests
 import re
-import json
 from collections import deque
-from typing import Callable, Optional
+from typing import Callable
+from argparse import ArgumentParser
 from Crypto.PublicKey import ECC
 from Crypto.Signature import DSS
 from Crypto.Hash import SHA256
@@ -149,6 +150,7 @@ atexit.register(cleanup_and_exit)
 
 def resolve_doh(domain, doh_url="https://cloudflare-dns.com/dns-query"):
     try:
+        import dns.message
         msg = dns.message.make_query(domain, 'A')
         wire = msg.to_wire()
         headers = {'accept': 'application/dns-message'}
@@ -267,17 +269,33 @@ class TCPTransport(BaseTransport):
         return d, self.raddr
     def close(self): self.sock.close()
 
-class TorTransport(TCPTransport):
+class TorTransport(BaseTransport):
     def __init__(self, remote_addr, tor_proxy="127.0.0.1", tor_port=9050):
-        import socks
+        try:
+            import socks
+        except ImportError:
+            print("PySocks is required for Tor transport. Install with: pip install pysocks")
+            sys.exit(1)
         self.sock = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.set_proxy(socks.SOCKS5, tor_proxy, tor_port)
         self.sock.connect(remote_addr)
         self.raddr = remote_addr
+    def send(self, data):
+        self.sock.sendall(len(data).to_bytes(2, 'big') + data)
+    def recv(self, bufsize=4096):
+        l = b''
+        while len(l) < 2:
+            l += self.sock.recv(2 - len(l))
+        length = int.from_bytes(l, 'big')
+        d = b''
+        while len(d) < length:
+            d += self.sock.recv(length - len(d))
+        return d, self.raddr
+    def close(self): self.sock.close()
 
 class Obfs4Transport(BaseTransport):
     def __init__(self, bridge_line, is_server=False, listen_port=None):
-        # For demo, just fallback to TCP. For real, spawn obfs4proxy subprocess.
+        # For demo: fallback to TCP. For real: spawn obfs4proxy subprocess.
         host, port = bridge_line.rsplit(":", 1)
         self.tcp = TCPTransport((host, int(port)))
     def send(self, data): self.tcp.send(data)
@@ -423,45 +441,69 @@ class GreenFoxServer:
                 except Exception as e:
                     print(f"[SERVER] Decrypt error: {e}")
 
-def build_transport_stack(server, port, config={}):
+def build_transport_stack_from_args(args, mode, server, port):
     stack = []
-    if config.get("obfs4_bridge"):
-        stack.append(('obfs4', lambda: Obfs4Transport(config["obfs4_bridge"])))
-    if config.get("front_domain"):
-        stack.append(('front', lambda: DomainFrontTransport(config["front_domain"], server, port)))
-    if config.get("meek_url") and config.get("front_domain"):
-        stack.append(('meek', lambda: MeekTransport(config["meek_url"], config["front_domain"])))
-    if config.get("tor_proxy"):
-        stack.append(('tor', lambda: TorTransport((server, port), config["tor_proxy"])))
+    # Priority: obfs4 > front > meek > tor > tcp > udp
+    if args.obfs4:
+        stack.append(('obfs4', lambda: Obfs4Transport(args.obfs4)))
+    if args.front:
+        stack.append(('front', lambda: DomainFrontTransport(args.front, server, port)))
+    if args.meek and args.front:
+        stack.append(('meek', lambda: MeekTransport(args.meek, args.front)))
+    if args.tor:
+        # Default Tor SOCKS5 is 127.0.0.1:9050, can be set with --torhost, --torport
+        stack.append(('tor', lambda: TorTransport((server, port), args.torhost, args.torport)))
     stack.append(('tcp', lambda: TCPTransport((server, port))))
     stack.append(('udp', lambda: UDPTransport((server, port))))
     return stack
 
+def parse_args():
+    parser = ArgumentParser(description="GreenFox VPN Protocol - Advanced Anti-Censorship VPN")
+    subparsers = parser.add_subparsers(dest='mode', help="server/client")
+    # Server mode
+    sp_srv = subparsers.add_parser('server')
+    sp_srv.add_argument('port', type=int, help="Listen port")
+    sp_srv.add_argument('--obfs4', help="obfs4 bridge (ip:port)")
+    sp_srv.add_argument('--front', help="Domain fronting (front.domain)")
+    sp_srv.add_argument('--meek', help="Meek URL")
+    sp_srv.add_argument('--tor', action='store_true', help="Enable Tor fallback")
+    sp_srv.add_argument('--torhost', default="127.0.0.1", help="Tor SOCKS5 host")
+    sp_srv.add_argument('--torport', type=int, default=9050, help="Tor SOCKS5 port")
+    sp_srv.add_argument('--tun', default='tun0', help="TUN device name")
+    # Client mode
+    sp_cli = subparsers.add_parser('client')
+    sp_cli.add_argument('server', help="Server address")
+    sp_cli.add_argument('port', type=int, help="Server port")
+    sp_cli.add_argument('server_pub_hex', help="Server pubkey (hex)")
+    sp_cli.add_argument('--obfs4', help="obfs4 bridge (ip:port)")
+    sp_cli.add_argument('--front', help="Domain fronting (front.domain)")
+    sp_cli.add_argument('--meek', help="Meek URL")
+    sp_cli.add_argument('--tor', action='store_true', help="Enable Tor fallback")
+    sp_cli.add_argument('--torhost', default="127.0.0.1", help="Tor SOCKS5 host")
+    sp_cli.add_argument('--torport', type=int, default=9050, help="Tor SOCKS5 port")
+    sp_cli.add_argument('--tun', default='tun1', help="TUN device name")
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  sudo python3 Protocol.py server <port> [config.json]")
-        print("  sudo python3 Protocol.py client <server> <port> <server_pub_hex> [config.json]")
-        sys.exit(1)
-    mode = sys.argv[1]
-    if mode == "server":
-        port = int(sys.argv[2]) if len(sys.argv) > 2 else 9999
-        config = {}
-        if len(sys.argv) > 3:
-            with open(sys.argv[3]) as f:
-                config = json.load(f)
-        s = GreenFoxServer(port=port, transports=build_transport_stack("0.0.0.0", port, config))
+    args = parse_args()
+    if args.mode == "server":
+        s = GreenFoxServer(
+            port=args.port,
+            tun_name=args.tun,
+            transports=build_transport_stack_from_args(args, "server", "0.0.0.0", args.port)
+        )
         s.run()
-    elif mode == "client":
-        server = sys.argv[2]
-        port = int(sys.argv[3])
-        server_pub_hex = sys.argv[4]
-        config = {}
-        if len(sys.argv) > 5:
-            with open(sys.argv[5]) as f:
-                config = json.load(f)
-        c = GreenFoxClient(server, port, server_pub_hex, transports=build_transport_stack(server, port, config))
+    elif args.mode == "client":
+        c = GreenFoxClient(
+            server=args.server,
+            port=args.port,
+            server_pub_hex=args.server_pub_hex,
+            tun_name=args.tun,
+            transports=build_transport_stack_from_args(args, "client", args.server, args.port)
+        )
         c.run()
     else:
-        print("[!] Unknown mode.")
+        print("Usage:")
+        print("  sudo python3 Protocol.py server <port> [--obfs4 ...] [--front ...] [--meek ...] [--tor]")
+        print("  sudo python3 Protocol.py client <server> <port> <server_pub_hex> [--obfs4 ...] [--front ...] [--meek ...] [--tor]")
         sys.exit(1)
