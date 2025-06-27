@@ -2,3 +2,4 @@ pycryptodome
 paramiko
 pysocks
 cryptography
+requests
