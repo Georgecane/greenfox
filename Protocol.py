@@ -64,6 +64,14 @@ def get_default_interface():
         return match.group(1)
     return None
 
+def get_public_ip():
+    try:
+        # Try to get public IP using a reliable service
+        ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        return ip
+    except Exception:
+        return None
+
 def enable_ip_forwarding():
     sh("sysctl -w net.ipv4.ip_forward=1")
 
@@ -410,6 +418,13 @@ class GreenFoxServer:
         self.transport = MultiTransport(transports)
         self.sessions = {}
         self.client_addr = None
+        # Show the server's public IP address
+        ip = get_public_ip()
+        if ip:
+            print(f"\n[SERVER] Public IP address: {ip}\n")
+        else:
+            print("\n[SERVER] Could not determine public IP address.\n")
+        print(f"[SERVER] Listening on port {port} (UDP/TCP/other as available)")
     def run(self):
         def tun_loop():
             while True:
@@ -443,7 +458,6 @@ class GreenFoxServer:
 
 def build_transport_stack_from_args(args, mode, server, port):
     stack = []
-    # Priority: obfs4 > front > meek > tor > tcp > udp
     if args.obfs4:
         stack.append(('obfs4', lambda: Obfs4Transport(args.obfs4)))
     if args.front:
@@ -451,7 +465,6 @@ def build_transport_stack_from_args(args, mode, server, port):
     if args.meek and args.front:
         stack.append(('meek', lambda: MeekTransport(args.meek, args.front)))
     if args.tor:
-        # Default Tor SOCKS5 is 127.0.0.1:9050, can be set with --torhost, --torport
         stack.append(('tor', lambda: TorTransport((server, port), args.torhost, args.torport)))
     stack.append(('tcp', lambda: TCPTransport((server, port))))
     stack.append(('udp', lambda: UDPTransport((server, port))))
