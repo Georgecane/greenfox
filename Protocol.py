@@ -373,14 +373,12 @@ class GreenFoxClient:
         set_dns_linux()
         self.priv, self.pub = x25519_generate()
         self.server_pub = x25519_pub_from_bytes(bytes.fromhex(server_pub_hex))
-        
-        # Transports
-        if transports is None:
-            transports = [
-                ('camouflage_443', lambda: WSCamouflageTransport((server, 443), host_header=server)),
-                ('udp_direct', lambda: UDPTransport((server, 9999)))
-            ]
-        self.transport = MultiTransport(transports)
+
+        # Always try TLS/WSCamouflage first, then fallback to UDP
+        self.transport = MultiTransport([
+            ('camouflage_tls', lambda: WSCamouflageTransport((server, port), host_header=server)),
+            ('udp_direct', lambda: UDPTransport((server, 9999)))
+        ])
         self.session = None
 
     def handshake(self):
@@ -454,6 +452,15 @@ class GreenFoxServer:
         self.tcp_sock.bind(('0.0.0.0', port))
         self.tcp_sock.listen(50)
         
+        # Print server info
+        import socket as _sock
+        try:
+            host_ip = _sock.gethostbyname(_sock.gethostname())
+        except Exception:
+            host_ip = '0.0.0.0'
+        pub_hex = x25519_pub_to_bytes(self.pub).hex()
+        print(f"\n[Server Info] Listening on: {host_ip}:{port}")
+        print(f"[Server Info] X25519 Public Key (hex): {pub_hex}\n")
         print(f"📢 [Server] Running: Camouflage/TLS on port {port}, UDP on 9999")
 
     def _read_exact(self, conn, length):
