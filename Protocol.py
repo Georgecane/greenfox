@@ -52,11 +52,6 @@ SERVER_TLS_KEY = 'greenfox_key.pem'
 # --- System & Network Helpers ---
 def sh(cmd: str) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-def check_root():
-    if os.geteuid() != 0:
-        print("[!] Must be run as root.")
-        sys.exit(1)
         
 def get_default_interface() -> Optional[str]:
     try:
@@ -342,7 +337,6 @@ class MultiTransport:
 # --- Client Logic ---
 class GreenFoxClient:
     def __init__(self, server, port, server_pub_hex, server_ecdsa_pub=None, tun_name='tun1', transports=None):
-        check_root()
         self.tun = tun_alloc(tun_name, auto_up=True, ip=f"10.8.0.2/24")
         save_default_route()
         save_resolv_conf()
@@ -405,7 +399,6 @@ class GreenFoxClient:
 # --- Server Logic ---
 class GreenFoxServer:
     def __init__(self, port=443, tun_name='tun0', my_vip='10.8.0.1'):
-        check_root()
         self.tun = tun_alloc(tun_name, auto_up=True, ip=f"{my_vip}/24")
         
         iface = get_default_interface()
