@@ -52,6 +52,16 @@ SERVER_TLS_KEY = 'greenfox_key.pem'
 # --- System & Network Helpers ---
 def sh(cmd: str) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def run_priv(cmd: str) -> subprocess.CompletedProcess:
+    """Run a shell command with elevated privileges when needed.
+    If the current process is root, run directly; otherwise prefix with sudo
+    so the system will prompt for the password when required.
+    """
+    if os.geteuid() == 0:
+        return sh(cmd)
+    # use subprocess.run to allow sudo to prompt for password on tty
+    return subprocess.run(cmd if cmd.startswith('sudo ') else f"sudo {cmd}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
 def get_default_interface() -> Optional[str]:
     try:
@@ -64,22 +74,22 @@ def get_default_interface() -> Optional[str]:
     return None
 
 def enable_ip_forwarding():
-    sh("sysctl -w net.ipv4.ip_forward=1")
+    run_priv("sysctl -w net.ipv4.ip_forward=1")
 
 def add_nat_rule(subnet, iface):
     check = f"iptables -t nat -C POSTROUTING -s {subnet} -o {iface} -j MASQUERADE"
     add = f"iptables -t nat -A POSTROUTING -s {subnet} -o {iface} -j MASQUERADE"
-    ret = subprocess.run(check, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ret = run_priv(check)
     if ret.returncode != 0:
-        subprocess.run(add, shell=True, check=False)
+        run_priv(add)
 
 def add_forward_rules(tun):
     for direction in ['-i', '-o']:
         check = f"iptables -C FORWARD {direction} {tun} -j ACCEPT"
         add = f"iptables -A FORWARD {direction} {tun} -j ACCEPT"
-        ret = subprocess.run(check, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ret = run_priv(check)
         if ret.returncode != 0:
-            subprocess.run(add, shell=True, check=False)
+            run_priv(add)
 
 def save_default_route():
     try:
@@ -95,9 +105,9 @@ def restore_default_route():
         if os.path.exists("/tmp/greenfoxvpn_orig_route"):
             with open("/tmp/greenfoxvpn_orig_route", "r") as f:
                 route = f.read().strip()
-            sh("ip route del default || true")
+            run_priv("ip route del default || true")
             if route:
-                sh(f"ip route add {route[8:]}")
+                run_priv(f"ip route add {route[8:]}")
             os.remove("/tmp/greenfoxvpn_orig_route")
     except Exception:
         pass
@@ -118,19 +128,32 @@ def restore_resolv_conf():
         pass
 
 def set_default_route_via_tun(tun_name="tun1"):
-    sh("ip route del default || true")
-    sh(f"ip route add default dev {tun_name}")
+    run_priv("ip route del default || true")
+    run_priv(f"ip route add default dev {tun_name}")
 
 def set_dns_linux(dns='1.1.1.1'):
     try:
-        with open("/etc/resolv.conf", "w") as f:
-            f.write(f"nameserver {dns}\n")
+        if os.geteuid() == 0:
+            with open("/etc/resolv.conf", "w") as f:
+                f.write(f"nameserver {dns}\n")
+        else:
+            # Use sudo tee so we don't need to re-exec the whole script
+            p = subprocess.run(f"echo 'nameserver {dns}' | sudo tee /etc/resolv.conf > /dev/null", shell=True)
+            return p
     except Exception:
         pass
 
 def tun_alloc(dev='tun0', auto_up=False, ip=None):
     if not os.path.exists('/dev/net/tun'):
         raise RuntimeError("TUN device /dev/net/tun not found. Are you running on Linux with tun/tap support and sufficient privileges?")
+    # If we're not running as root, try to create the interface using sudo
+    if os.geteuid() != 0:
+        try:
+            user = os.environ.get('SUDO_USER') or os.environ.get('USER') or 'root'
+            # create a tuntap device owned/usable by the user
+            run_priv(f"ip tuntap add dev {dev} mode tun user {user}")
+        except Exception:
+            pass
     tun = os.open('/dev/net/tun', os.O_RDWR)
     ifr = struct.pack('16sH', dev.encode(), IFF_TUN | IFF_NO_PI)
     try:
@@ -143,9 +166,9 @@ def tun_alloc(dev='tun0', auto_up=False, ip=None):
             pass
         raise RuntimeError(f"Failed to allocate TUN device {dev}: {e}. Are you running as root?")
     if auto_up and ip:
-        subprocess.run(['ip', 'addr', 'add', ip, 'dev', dev], check=False)
-        subprocess.run(['ip', 'link', 'set', dev, 'mtu', str(TUN_MTU)], check=False)
-        subprocess.run(['ip', 'link', 'set', dev, 'up'], check=False)
+        run_priv(f"ip addr add {ip} dev {dev}")
+        run_priv(f"ip link set {dev} mtu {TUN_MTU}")
+        run_priv(f"ip link set {dev} up")
     return tun
 
 def cleanup_and_exit(signum=None, frame=None):
@@ -154,14 +177,14 @@ def cleanup_and_exit(signum=None, frame=None):
     restore_default_route()
     restore_resolv_conf()
     for tun in ['tun0', 'tun1']:
-        subprocess.run(f"ip link delete {tun}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_priv(f"ip link delete {tun}")
     iface = get_default_interface()
     if iface:
-        subprocess.run(f"iptables -t nat -D POSTROUTING -s {VPN_SUBNET} -o {iface} -j MASQUERADE", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_priv(f"iptables -t nat -D POSTROUTING -s {VPN_SUBNET} -o {iface} -j MASQUERADE")
         for tun in ['tun0', 'tun1']:
             for direction in ['-i', '-o']:
-                subprocess.run(f"iptables -D FORWARD {direction} {tun} -j ACCEPT", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    sh("sysctl -w net.ipv4.ip_forward=0")
+                run_priv(f"iptables -D FORWARD {direction} {tun} -j ACCEPT")
+    run_priv("sysctl -w net.ipv4.ip_forward=0")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, cleanup_and_exit)
