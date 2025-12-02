@@ -44,13 +44,18 @@ MIN_PAD = 16
 MAX_PAD = 80
 DEFAULT_DNS = '8.8.8.8'
 
-# Anti-Censorship & DPI Evasion Settings
+# Anti-Censorship & DPI Evasion Settings for Iran's Antigravity Blocking
 PACKET_JITTER_MIN = 5      # Min milliseconds jitter between packets
 PACKET_JITTER_MAX = 50     # Max milliseconds jitter between packets
 DECOY_PACKET_RATIO = 0.1   # Send decoy packets 10% of the time
 MTU_FRAGMENTATION = 500    # Fragment larger packets to avoid pattern matching
 RANDOMIZE_DELAYS = True    # Enable random delays to evade timing analysis
 USE_TLS_FAKE_SNI = True    # Use random SNI for each connection (evasion)
+MORPHING_ENABLED = True    # Enable traffic morphing (blend with Antigravity HTTPS)
+SPOOF_CLOUD_IDE = True     # Spoof as Google Cloud IDE (Antigravity) traffic
+INJECT_NOISE = True        # Inject random HTTP headers to evade pattern matching
+DNS_TUNNEL = True          # Use DNS tunneling as fallback
+ANTIGRAVITY_BYPASS = True  # Enable specific Antigravity censorship bypasses
 
 # Server Key Paths
 SERVER_ECDSA_PRIV_FILE = 'greenfox_server_ecdsa_priv.pem'
@@ -82,6 +87,99 @@ def randomize_sni():
         'cdn.example.com', 'api.example.com', 'static.example.com'
     ]
     return random.choice(domains)
+
+def get_cloud_ide_headers():
+    """Generate headers that mimic Google Cloud IDE (Antigravity) / IDE-on-cloud traffic."""
+    # Antigravity-specific cloud hosts + other IDE services to blend in
+    cloud_hosts = [
+        'antigravity.google',  # Google Antigravity direct
+        'cloud.google.com', 'ide.cloud.google.com',
+        'editor.cloud.google.com', 'code.cloud.google.com',
+        'workbench.cloud.google.com',  # Google Cloud Workbench
+        'ide.c9.io', 'replit.com',
+        'codesandbox.io', 'gitpod.io',
+        'github.dev', 'github.com',
+        'aws-cloud9-*.amazonaws.com',
+        'codeanywhere.com', 'koding.com',
+        'onlineide.io', 'stackblitz.com'
+    ]
+    
+    headers = {
+        'Host': random.choice(cloud_hosts),
+        'User-Agent': random.choice([
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 (Cloud IDE)',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0 (IDE)',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (IDE Editor)',
+        ]),
+        'Referer': random.choice([
+            'https://antigravity.google/',
+            'https://cloud.google.com/code-editor',
+            'https://cloud.google.com/workbench',
+            'https://ide.c9.io/',
+            'https://replit.com/~',
+            'https://gitpod.io/projects',
+            'https://github.dev/',
+            'https://codesandbox.io/'
+        ]),
+        'X-Forwarded-For': f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}",
+        'X-Real-IP': f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}",
+        'X-Forwarded-Proto': random.choice(['https', 'http']),
+        'X-Originating-IP': f"[{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}]",
+        'CF-Connecting-IP': f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}",
+    }
+    return headers
+
+def morph_traffic():
+    """Add random traffic morphing to blend with Google Antigravity / cloud IDE API traffic."""
+    if MORPHING_ENABLED:
+        # Simulate legitimate Google Cloud IDE / Antigravity API traffic patterns
+        noise_types = [
+            b'GET /api/v1/health HTTP/1.1\r\nHost: api.cloud.google.com\r\n\r\n',
+            b'GET /api/editor/status HTTP/1.1\r\nHost: editor.cloud.google.com\r\n\r\n',
+            b'POST /api/session/keepalive HTTP/1.1\r\nHost: cloud.google.com\r\nContent-Length: 2\r\n\r\n{}',
+            b'OPTIONS /api/editor HTTP/1.1\r\nHost: cloud.google.com\r\n\r\n',
+            b'GET /api/workbench/status HTTP/1.1\r\nHost: workbench.cloud.google.com\r\n\r\n',
+            b'POST /api/files/list HTTP/1.1\r\nHost: editor.cloud.google.com\r\nContent-Length: 10\r\n\r\n{"path":"/"}',
+            b'GET /api/terminal/info HTTP/1.1\r\nHost: cloud.google.com\r\n\r\n',
+            b'POST /api/debug/eval HTTP/1.1\r\nHost: editor.cloud.google.com\r\nContent-Length: 0\r\n\r\n',
+            b'GET /static/editor.js HTTP/1.1\r\nHost: cdn.cloud.google.com\r\n\r\n',
+            b'GET /api/plugins/list HTTP/1.1\r\nHost: cloud.google.com\r\n\r\n',
+            # Other IDE patterns
+            b'GET /api/v1/extensions HTTP/1.1\r\n\r\n',
+            b'POST /api/auth/refresh HTTP/1.1\r\n\r\n',
+        ]
+        return random.choice(noise_types)
+    return b''
+
+def antigravity_bypass():
+    """Antigravity-specific censorship bypass: randomize request patterns and add decoys.
+    Iran's Antigravity censorship may detect:
+    - Connection patterns to known Google IPs
+    - TLS ClientHello fingerprints
+    - HTTP header sequences
+    - Traffic volume signatures
+    """
+    techniques = []
+    
+    # 1. Random request ordering (avoid signature patterns)
+    if random.random() < 0.3:
+        return random.choice([
+            b'HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n',  # Decoy HEAD request
+            b'TRACE / HTTP/1.1\r\nHost: example.com\r\n\r\n',   # Decoy TRACE request
+            b'CONNECT example.com:443 HTTP/1.1\r\n\r\n'         # Decoy CONNECT tunnel
+        ])
+    
+    # 2. Random delays between operations
+    if RANDOMIZE_DELAYS:
+        time.sleep(random.uniform(0.01, 0.1))
+    
+    # 3. Send decoy packets to random addresses
+    if random.random() < DECOY_PACKET_RATIO:
+        add_decoy_packet(None, None)
+    
+    return None
 
 # --- System & Network Helpers ---
 def sh(cmd: str) -> subprocess.CompletedProcess:
@@ -374,39 +472,68 @@ class WSCamouflageTransport:
         
         anti_dpi_jitter()  # More jitter between handshake steps
         
-        # 1. Fake Handshake (Looks like WebSocket Upgrade with realistic headers)
+        # 1. Fake Handshake (Looks like WebSocket Upgrade with Cloud IDE headers)
         ws_key = base64.b64encode(get_random_bytes(16)).decode()
-        # Randomize User-Agent to avoid fingerprinting
-        user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15'
-        ]
-        user_agent = random.choice(user_agents)
         
-        handshake = (
-            f"GET /ws HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"User-Agent: {user_agent}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {ws_key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n"
-            f"Accept-Encoding: gzip, deflate\r\n"
-            f"Accept-Language: en-US,en;q=0.9\r\n"
-            f"\r\n"
-        ).encode()
+        # Use cloud IDE headers to evade Google Cloud IDE (Antigravity) censorship
+        if SPOOF_CLOUD_IDE:
+            cloud_headers = get_cloud_ide_headers()
+            handshake = (
+                f"GET /ws HTTP/1.1\r\n"
+                f"Host: {cloud_headers['Host']}\r\n"
+                f"User-Agent: {cloud_headers['User-Agent']}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"Accept-Encoding: gzip, deflate\r\n"
+                f"Accept-Language: en-US,en;q=0.9\r\n"
+                f"X-Forwarded-For: {cloud_headers.get('X-Forwarded-For', '127.0.0.1')}\r\n"
+                f"X-Real-IP: {cloud_headers.get('X-Real-IP', '127.0.0.1')}\r\n"
+                f"Referer: {cloud_headers['Referer']}\r\n"
+                f"\r\n"
+            ).encode()
+        else:
+            user_agent = random.choice([
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15'
+            ])
+            
+            handshake = (
+                f"GET /ws HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {user_agent}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"Accept-Encoding: gzip, deflate\r\n"
+                f"Accept-Language: en-US,en;q=0.9\r\n"
+                f"\r\n"
+            ).encode()
         
         self.tls.sendall(handshake)
         anti_dpi_jitter()  # Jitter before receiving response
         # 2. Receive and check response (just check if socket stays alive)
         self.tls.recv(4096)
-        print(f"[Camouflage] Handshake OK via {host} (DPI evasion active)")
+        print(f"[Camouflage] Handshake OK via {host} (DPI evasion + Antigravity bypass active)")
 
     def send(self, data: bytes):
+        # Apply Antigravity-specific bypass if enabled
+        if ANTIGRAVITY_BYPASS:
+            antigravity_bypass()
+        
         # Prepend a 4-byte length header for GreenFox packets
         packet = len(data).to_bytes(4, 'big') + data
+        
+        # Inject random traffic morphing to blend with legitimate Antigravity IDE traffic
+        if INJECT_NOISE and random.random() < 0.05:  # 5% of sends get morphed
+            noise = morph_traffic()
+            if noise:
+                self.tls.sendall(noise)
+                anti_dpi_jitter()
         
         # Fragment large packets to avoid DPI pattern matching
         if len(packet) > MTU_FRAGMENTATION:
@@ -420,6 +547,12 @@ class WSCamouflageTransport:
         anti_dpi_jitter()  # Jitter after send
         
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
+        # Apply Antigravity-specific bypass during receive
+        if ANTIGRAVITY_BYPASS:
+            antigravity_bypass()
+        
+        anti_dpi_jitter()  # Jitter before reading
+        
         # Read the 4-byte length prefix
         l = b''
         while len(l) < 4:
@@ -434,6 +567,8 @@ class WSCamouflageTransport:
             chunk = self.tls.recv(length - len(d))
             if not chunk: raise ConnectionError('Camouflage pipe closed')
             d += chunk
+            anti_dpi_jitter()  # Jitter between receive chunks
+        
         return d, self.raddr
         
     def close(self):
@@ -531,6 +666,12 @@ class GreenFoxClient:
 class GreenFoxServer:
     def __init__(self, port=443, tun_name='tun0', my_vip='10.8.0.1'):
         self.tun = tun_alloc(tun_name, auto_up=True, ip=f"{my_vip}/24")
+        self.tun_name = tun_name
+        
+        # Set TUN device to non-blocking mode to avoid hangs on bad reads
+        import fcntl
+        flags = fcntl.fcntl(self.tun, fcntl.F_GETFL)
+        fcntl.fcntl(self.tun, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         
         iface = get_default_interface()
         if iface:
@@ -664,17 +805,47 @@ class GreenFoxServer:
             if peer_key in self.sessions: del self.sessions[peer_key]
 
     def _tun_loop(self):
+        """Read packets from TUN device and forward to all active sessions."""
+        consecutive_errors = 0
         while True:
-            packet = os.read(self.tun, MAX_READ_SIZE)
-            if not packet: continue
-            wrapped = ucp_wrap(packet)
-            dead_keys = []
-            for k, (sess, send_fn) in self.sessions.items():
+            try:
                 try:
-                    send_fn(sess.encrypt(wrapped))
-                except:
-                    dead_keys.append(k)
-            for k in dead_keys: del self.sessions[k]
+                    # Non-blocking read from TUN device
+                    packet = os.read(self.tun, MAX_READ_SIZE)
+                except BlockingIOError:
+                    # No data available right now; sleep briefly and continue
+                    time.sleep(0.001)
+                    consecutive_errors = 0
+                    continue
+                
+                if not packet:
+                    consecutive_errors = 0
+                    continue
+                
+                consecutive_errors = 0
+                wrapped = ucp_wrap(packet)
+                dead_keys = []
+                for k, (sess, send_fn) in self.sessions.items():
+                    try:
+                        send_fn(sess.encrypt(wrapped))
+                    except Exception:
+                        dead_keys.append(k)
+                for k in dead_keys:
+                    del self.sessions[k]
+                    
+            except OSError as e:
+                # Handle "Bad address" and other TUN read errors gracefully
+                consecutive_errors += 1
+                if consecutive_errors > 100:
+                    print(f"[TUN] Too many consecutive errors ({consecutive_errors}), TUN device may be invalid")
+                    break
+                time.sleep(0.01)
+            except Exception as e:
+                print(f"[TUN] Unexpected error in _tun_loop: {e}")
+                consecutive_errors += 1
+                if consecutive_errors > 50:
+                    break
+                time.sleep(0.01)
 
 # --- Main Entry Point ---
 if __name__ == "__main__":
