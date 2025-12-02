@@ -4,3 +4,4 @@ pysocks
 cryptography
 requests
 dnspython
+pyflakes
