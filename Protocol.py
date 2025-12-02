@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
 """
 GreenFox Protocol - Fixed / Hardened Single-file Implementation
-
-Key fixes and improvements included in this version:
-- X25519 ephemeral key exchange with server ECDSA-signed public key proof (prevents MITM when server ECDSA pubkey is known/pinned)
-- Deterministic 12-byte nonce: 4-byte session id + 8-byte counter (prevents nonce reuse and simplifies replay protection)
-- O(1) replay protection via monotonic receive counter stored per-session
-- Unified transport recv() interface -> returns (data, addr)
-- Server: separate UDP listener and TCP listener (accept loop). Each TCP connection handled in its own thread and integrated into session map.
-- Proper validation in ucp_unwrap (checks lengths, pad range)
-- Simple persistent ECDSA server keyfile handling (server stores ecdsa_priv.pem/ecdsa_pub.pem)
-- Client can (and should) be given expected server ECDSA public key (hex or file) to verify server's signed X25519 pubkey
-- Improved error handling and idempotent iptables operations left as-is but safer cleanup
-
-Notes:
-- This is an opinionated, single-file demo/hardening. For production you should:
-  * move crypto key management out of single file (use secure storage)
-  * run under a limited service account with CAP_NET_ADMIN instead of full root where possible
-  * use obfs4proxy and proper transport daemons rather than naive fallbacks
-
-Dependencies: cryptography, pycryptodome, pysocks, dnspython, requests
-
+Includes: Tor-transparent (serverless) automatic docker container creation (host network),
+iptables redirection from TUN -> Tor TransPort/DNSPort, secure X25519+ECDSA handshake,
+ChaCha20-Poly1305 encryption with nonce-counter, unified transports (UDP/TCP/Tor).
 """
 
 import os
@@ -51,7 +34,7 @@ from Crypto.Random import get_random_bytes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import serialization
 
-# Optional: dnspython may be used for DOH message construction if available
+# Optional: dnspython may be used for DOH if available
 try:
     import dns.message
     _HAS_DNSPY = True
@@ -72,18 +55,20 @@ DEFAULT_DNS = '1.1.1.1'
 SERVER_ECDSA_PRIV_FILE = 'greenfox_server_ecdsa_priv.pem'
 SERVER_ECDSA_PUB_FILE = 'greenfox_server_ecdsa_pub.pem'
 
+# Tor container / tor-trans globals
+_TOR_CONTAINER_NAME = 'greenfox_tor'
+_TOR_DOCKER_IMAGE = 'dperson/torproxy'
+_TOR_TMPDIR = '/tmp/greenfox_tor'
+_TOR_TRANS_RULES = []
 
 # --- Utility shell helpers ---
-
 def sh(cmd: str) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
 
 def check_root():
     if os.geteuid() != 0:
         print("[!] Must be run as root.")
         sys.exit(1)
-
 
 def get_default_interface() -> Optional[str]:
     try:
@@ -95,7 +80,6 @@ def get_default_interface() -> Optional[str]:
         pass
     return None
 
-
 def get_public_ip():
     try:
         ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
@@ -103,10 +87,8 @@ def get_public_ip():
     except Exception:
         return None
 
-
 def enable_ip_forwarding():
     sh("sysctl -w net.ipv4.ip_forward=1")
-
 
 def add_nat_rule(subnet, iface):
     check = f"iptables -t nat -C POSTROUTING -s {subnet} -o {iface} -j MASQUERADE"
@@ -115,7 +97,6 @@ def add_nat_rule(subnet, iface):
     if ret.returncode != 0:
         subprocess.run(add, shell=True, check=False)
 
-
 def add_forward_rules(tun):
     for direction in ['-i', '-o']:
         check = f"iptables -C FORWARD {direction} {tun} -j ACCEPT"
@@ -123,7 +104,6 @@ def add_forward_rules(tun):
         ret = subprocess.run(check, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if ret.returncode != 0:
             subprocess.run(add, shell=True, check=False)
-
 
 def save_default_route():
     try:
@@ -134,22 +114,17 @@ def save_default_route():
     except Exception:
         pass
 
-
 def restore_default_route():
     try:
         if os.path.exists(ORIG_ROUTE_FILE):
             with open(ORIG_ROUTE_FILE, "r") as f:
                 route = f.read().strip()
-            # delete current default then add saved
             sh("ip route del default || true")
             if route:
-                # route line is like 'default via 192.0.2.1 dev eth0 proto static'
-                # we'll add it back by stripping leading 'default '
                 sh(f"ip route add {route[8:]}")
             os.remove(ORIG_ROUTE_FILE)
     except Exception:
         pass
-
 
 def save_resolv_conf():
     try:
@@ -157,7 +132,6 @@ def save_resolv_conf():
             shutil.copy("/etc/resolv.conf", ORIG_RESOLV_FILE)
     except Exception:
         pass
-
 
 def restore_resolv_conf():
     try:
@@ -167,11 +141,9 @@ def restore_resolv_conf():
     except Exception:
         pass
 
-
 def set_default_route_via_tun(tun_name="tun1"):
     sh("ip route del default || true")
     sh(f"ip route add default dev {tun_name}")
-
 
 def set_dns_linux(dns=DEFAULT_DNS):
     try:
@@ -180,9 +152,16 @@ def set_dns_linux(dns=DEFAULT_DNS):
     except Exception:
         pass
 
-
 def cleanup_and_exit(signum=None, frame=None):
     print("[*] Cleaning up...")
+    try:
+        disable_tor_transparent()
+    except Exception:
+        pass
+    try:
+        stop_tor_container()
+    except Exception:
+        pass
     restore_default_route()
     restore_resolv_conf()
     for tun in ['tun0', 'tun1']:
@@ -200,9 +179,87 @@ signal.signal(signal.SIGINT, cleanup_and_exit)
 signal.signal(signal.SIGTERM, cleanup_and_exit)
 atexit.register(cleanup_and_exit)
 
+# --- Tor transparent (serverless) helpers ---
+def ensure_docker_available() -> bool:
+    try:
+        subprocess.run(['docker', 'version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except Exception:
+        return False
+
+def prepare_torrc(path: str, trans_port: int = 9040, dns_port: int = 53) -> str:
+    content = f"""SocksPort 9050
+TransPort {trans_port}
+DNSPort {dns_port}
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+Log notice stdout
+"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(content)
+    return path
+
+def pull_tor_image():
+    print('[TOR-CONTAINER] Pulling tor image...')
+    subprocess.run(['docker', 'pull', _TOR_DOCKER_IMAGE], check=False)
+
+def run_tor_container_hostnet(torrc_host_path: str) -> bool:
+    if not ensure_docker_available():
+        print('[TOR-CONTAINER] docker CLI not found. Please install Docker or run a tor VM manually.')
+        return False
+    pull_tor_image()
+    subprocess.run(['docker', 'rm', '-f', _TOR_CONTAINER_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = [
+        'docker', 'run', '-d', '--name', _TOR_CONTAINER_NAME,
+        '--restart', 'unless-stopped',
+        '--cap-add', 'NET_ADMIN',
+        '--network', 'host',
+        '-v', f'{torrc_host_path}:/etc/tor/torrc:ro',
+        _TOR_DOCKER_IMAGE
+    ]
+    print('[TOR-CONTAINER] Starting tor container (host networked)...')
+    try:
+        subprocess.run(cmd, check=True)
+        print('[TOR-CONTAINER] Started.')
+        return True
+    except Exception as e:
+        print(f'[TOR-CONTAINER] Failed to start: {e}')
+        return False
+
+def stop_tor_container():
+    try:
+        subprocess.run(['docker', 'rm', '-f', _TOR_CONTAINER_NAME], check=False)
+        print('[TOR-CONTAINER] Stopped and removed (if existed).')
+    except Exception:
+        pass
+
+def enable_tor_transparent(container_ip: str = '127.0.0.1', trans_port: int = 9040, dns_port: int = 53, tun: str = 'tun1', hostnet: bool = True):
+    global _TOR_TRANS_RULES
+    iface = get_default_interface() or 'eth0'
+    cmds = []
+    if hostnet:
+        cmds.append(f"iptables -t nat -A PREROUTING -i {tun} -p tcp -j REDIRECT --to-ports {trans_port}")
+        cmds.append(f"iptables -t nat -A PREROUTING -i {tun} -p udp --dport 53 -j REDIRECT --to-ports {dns_port}")
+    else:
+        cmds.append(f"iptables -t nat -A PREROUTING -i {tun} -p tcp -j DNAT --to-destination {container_ip}:{trans_port}")
+        cmds.append(f"iptables -t nat -A PREROUTING -i {tun} -p udp --dport 53 -j DNAT --to-destination {container_ip}:{dns_port}")
+        cmds.append(f"iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE")
+    for c in cmds:
+        subprocess.run(c, shell=True)
+    _TOR_TRANS_RULES = cmds
+    set_dns_linux(container_ip if not hostnet else '127.0.0.1')
+    print(f"[TOR-TRANS] Enabled: tun->{container_ip}:{trans_port} (hostnet={hostnet}), dns->{'127.0.0.1' if hostnet else container_ip}:{dns_port}")
+
+def disable_tor_transparent():
+    global _TOR_TRANS_RULES
+    for c in reversed(_TOR_TRANS_RULES):
+        c_del = c.replace('-A', '-D', 1)
+        subprocess.run(c_del, shell=True)
+    _TOR_TRANS_RULES = []
+    print('[TOR-TRANS] Disabled')
 
 # --- DOH resolver (best-effort) ---
-
 def resolve_doh(domain, doh_url="https://cloudflare-dns.com/dns-query"):
     if not _HAS_DNSPY:
         return []
@@ -218,9 +275,7 @@ def resolve_doh(domain, doh_url="https://cloudflare-dns.com/dns-query"):
         print(f"[DOH] Failed {domain} ({e})")
         return []
 
-
 # --- TUN allocation ---
-
 def tun_alloc(dev='tun0', auto_up=False, ip=None):
     if len(dev) > 15:
         print(f"[!] Device name '{dev}' too long (max 15 chars).")
@@ -241,41 +296,30 @@ def tun_alloc(dev='tun0', auto_up=False, ip=None):
         subprocess.run(['ip', 'link', 'set', dev, 'up'], check=False)
     return tun
 
-
 # --- X25519 helpers ---
-
 def x25519_generate():
     priv = X25519PrivateKey.generate()
     pub = priv.public_key()
     return priv, pub
 
-
 def x25519_derive(priv: X25519PrivateKey, peer_pub: X25519PublicKey) -> bytes:
     shared = priv.exchange(peer_pub)
-    # derive a 32-byte key via SHA256
     return PySHA256.new(shared).digest()
-
 
 def x25519_pub_to_bytes(pub: X25519PublicKey) -> bytes:
     return pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
 
-
 def x25519_pub_from_bytes(data: bytes) -> X25519PublicKey:
     return X25519PublicKey.from_public_bytes(data)
 
-
 # --- ECDSA helpers (server long-term) ---
-
 def ecdsa_generate_and_save(priv_path=SERVER_ECDSA_PRIV_FILE, pub_path=SERVER_ECDSA_PUB_FILE):
     key = ECC.generate(curve='P-256')
-    # Save private
     with open(priv_path, 'wt') as f:
         f.write(key.export_key(format='PEM'))
-    # Save public
     with open(pub_path, 'wt') as f:
         f.write(key.public_key().export_key(format='PEM'))
     return key, key.public_key()
-
 
 def ecdsa_load(priv_path=SERVER_ECDSA_PRIV_FILE, pub_path=SERVER_ECDSA_PUB_FILE):
     if os.path.exists(priv_path) and os.path.exists(pub_path):
@@ -286,12 +330,10 @@ def ecdsa_load(priv_path=SERVER_ECDSA_PRIV_FILE, pub_path=SERVER_ECDSA_PUB_FILE)
         return key, pub
     return None, None
 
-
 def sign_bytes(ecdsa_priv: ECC.EccKey, data: bytes) -> bytes:
     h = PySHA256.new(data)
     signer = DSS.new(ecdsa_priv, 'fips-186-3')
     return signer.sign(h)
-
 
 def verify_bytes(ecdsa_pub: ECC.EccKey, data: bytes, signature: bytes) -> bool:
     h = PySHA256.new(data)
@@ -302,17 +344,13 @@ def verify_bytes(ecdsa_pub: ECC.EccKey, data: bytes, signature: bytes) -> bool:
     except ValueError:
         return False
 
-
 # --- UCP helpers (wrapping) ---
-
 def ucp_wrap(data: bytes, msg_type: int = 1) -> bytes:
     pad_len = random.randint(MIN_PAD, MAX_PAD)
     padding = get_random_bytes(pad_len)
     return bytes([msg_type]) + bytes([pad_len]) + padding + data
 
-
 def ucp_unwrap(data: bytes) -> Tuple[int, bytes]:
-    # validate minimal length
     if len(data) < 2:
         raise ValueError('UCP data too short')
     msg_type = data[0]
@@ -324,11 +362,10 @@ def ucp_unwrap(data: bytes) -> Tuple[int, bytes]:
         raise ValueError('UCP payload truncated')
     return msg_type, data[header_len:]
 
-
 # --- Session with nonce-counter and simple replay protection ---
 class GreenFoxSession:
     def __init__(self, key: bytes, sid: int):
-        self.key = key  # 32 bytes
+        self.key = key
         self.sid = sid & 0xffffffff
         self.send_counter = 0
         self.recv_max = -1
@@ -358,18 +395,14 @@ class GreenFoxSession:
         self.recv_max = counter
         return plain
 
-
-# --- Transport base & client-side MultiTransport fallback ---
+# --- Transport base & transports ---
 class BaseTransport:
     def send(self, data: bytes):
         raise NotImplementedError()
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         raise NotImplementedError()
-
     def close(self):
         pass
-
 
 class UDPTransport(BaseTransport):
     def __init__(self, remote_addr: Tuple[str, int], listen_port: Optional[int] = None):
@@ -378,29 +411,22 @@ class UDPTransport(BaseTransport):
         self.raddr = remote_addr
         if listen_port:
             self.sock.bind(('0.0.0.0', listen_port))
-
     def send(self, data: bytes):
         self.sock.sendto(data, self.raddr)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         d, addr = self.sock.recvfrom(bufsize)
         return d, addr
-
     def close(self):
         self.sock.close()
 
-
 class TCPTransport(BaseTransport):
-    # client-side TCP transport (connected socket)
     def __init__(self, remote_addr: Tuple[str, int], timeout: Optional[float] = 10.0):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         self.sock.connect(remote_addr)
         self.raddr = remote_addr
-
     def send(self, data: bytes):
         self.sock.sendall(len(data).to_bytes(2, 'big') + data)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         l = b''
         while len(l) < 2:
@@ -416,13 +442,11 @@ class TCPTransport(BaseTransport):
                 raise ConnectionError('TCP closed while reading payload')
             d += chunk
         return d, self.raddr
-
     def close(self):
         try:
             self.sock.close()
         except Exception:
             pass
-
 
 class TorTransport(BaseTransport):
     def __init__(self, remote_addr: Tuple[str, int], tor_proxy="127.0.0.1", tor_port=9050):
@@ -435,10 +459,8 @@ class TorTransport(BaseTransport):
         self.sock.set_proxy(socks.SOCKS5, tor_proxy, tor_port)
         self.sock.connect(remote_addr)
         self.raddr = remote_addr
-
     def send(self, data: bytes):
         self.sock.sendall(len(data).to_bytes(2, 'big') + data)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         l = b''
         while len(l) < 2:
@@ -448,26 +470,20 @@ class TorTransport(BaseTransport):
         while len(d) < length:
             d += self.sock.recv(length - len(d))
         return d, self.raddr
-
     def close(self):
         self.sock.close()
 
-
-# Obfs4/Domain fronting/Meek: left as simple placeholders (production must call obfs4proxy etc.)
+# obfs4/domainfront/meek placeholders (production use obfs4proxy etc.)
 class Obfs4Transport(BaseTransport):
     def __init__(self, bridge_line, is_server=False, listen_port=None):
         host, port = bridge_line.rsplit(":", 1)
         self.tcp = TCPTransport((host, int(port)))
-
     def send(self, data: bytes):
         self.tcp.send(data)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         return self.tcp.recv(bufsize)
-
     def close(self):
         self.tcp.close()
-
 
 class DomainFrontTransport(BaseTransport):
     def __init__(self, front_domain, real_addr, port=443):
@@ -480,38 +496,29 @@ class DomainFrontTransport(BaseTransport):
         resp = self.tls.recv(4096)
         if b"200" not in resp:
             raise Exception("[Fronting] CONNECT failed")
-
     def send(self, data: bytes):
         self.tls.sendall(data)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         d = self.tls.recv(bufsize)
         return d, (self.tls.getpeername()[0], self.tls.getpeername()[1])
-
     def close(self):
         self.tls.close()
-
 
 class MeekTransport(BaseTransport):
     def __init__(self, meek_url, front_domain):
         self.session = requests.Session()
         self.url = meek_url
         self.front = front_domain
-
     def send(self, data: bytes):
         headers = {'Host': self.front}
         self.session.post(self.url, data=data, headers=headers)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         return b"", ('0.0.0.0', 0)
-
     def close(self):
         pass
 
-
 class MultiTransport(BaseTransport):
     def __init__(self, transports):
-        # transports: list of (name, callable -> BaseTransport)
         self.transports = transports
         self.active = None
         self.active_name = None
@@ -528,17 +535,13 @@ class MultiTransport(BaseTransport):
                 print(f"[!] {name} failed: {e}")
         if self.active is None:
             raise Exception(f"All transports failed, last: {last_exc}")
-
     def send(self, data: bytes):
         self.active.send(data)
-
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         return self.active.recv(bufsize)
-
     def close(self):
         if self.active:
             self.active.close()
-
 
 # --- High-level client/server classes ---
 class GreenFoxClient:
@@ -556,7 +559,6 @@ class GreenFoxClient:
         self.server_pub = x25519_pub_from_bytes(bytes.fromhex(server_pub_hex))
         self.server_ecdsa_pub = None
         if server_ecdsa_pub:
-            # server_ecdsa_pub can be PEM bytes or hex; try to parse
             try:
                 self.server_ecdsa_pub = ECC.import_key(server_ecdsa_pub)
             except Exception:
@@ -574,11 +576,9 @@ class GreenFoxClient:
         self.handshake_done = False
 
     def handshake(self):
-        # send our x25519 pub
         payload = x25519_pub_to_bytes(self.pub)
         self.transport.send(b'HANDSHAKE:' + payload)
         data, addr = self.transport.recv()
-        # expect: PUBKEY:<server_pub_raw>:SIG:<sig_len(2)><sig_bytes>
         if not data.startswith(b'PUBKEY:'):
             print('[CLIENT] Handshake failed (no PUBKEY)')
             sys.exit(2)
@@ -589,7 +589,6 @@ class GreenFoxClient:
         except Exception:
             print('[CLIENT] Handshake response malformed')
             sys.exit(2)
-        # verify signature if we have pinned server ecdsa pub
         if self.server_ecdsa_pub is None:
             print('[CLIENT] Warning: no server ECDSA pubkey pinned. MITM susceptible. Continue at your own risk.')
         else:
@@ -606,13 +605,11 @@ class GreenFoxClient:
     def run(self):
         if not self.handshake_done:
             self.handshake()
-
         def tun_loop():
             while True:
                 packet = os.read(self.tun, MAX_PACKET)
                 wrapped = ucp_wrap(packet, msg_type=1)
                 self.transport.send(self.session.encrypt(wrapped))
-
         threading.Thread(target=tun_loop, daemon=True).start()
         while True:
             data, addr = self.transport.recv()
@@ -624,7 +621,6 @@ class GreenFoxClient:
             except Exception as e:
                 print(f"[CLIENT] Decrypt error: {e}")
 
-
 class GreenFoxServer:
     def __init__(self, port=9999, tun_name='tun0', my_vip='10.8.0.1', transports=None, auto_up=True,
                  ecdsa_priv_path=SERVER_ECDSA_PRIV_FILE, ecdsa_pub_path=SERVER_ECDSA_PUB_FILE):
@@ -635,23 +631,19 @@ class GreenFoxServer:
             enable_ip_forwarding()
             add_nat_rule(VPN_SUBNET, iface)
             add_forward_rules(tun_name)
-        # load or generate server ECDSA keypair
         priv, pub = ecdsa_load(ecdsa_priv_path, ecdsa_pub_path)
         if priv is None:
             priv, pub = ecdsa_generate_and_save(ecdsa_priv_path, ecdsa_pub_path)
             print('[SERVER] Generated new ECDSA keypair and saved to files.')
         self.ecdsa_priv = priv
         self.ecdsa_pub = pub
-        # x25519 key (ephemeral for this server process)
         self.priv, self.pub = x25519_generate()
         self.my_vip = my_vip
         self.port = port
-        self.sessions = {}  # map addr_key -> (session, transport_send_callable)
-        # UDP socket bound
+        self.sessions = {}
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp_sock.bind(('0.0.0.0', port))
-        # TCP listener socket
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.tcp_sock.bind(('0.0.0.0', port))
@@ -678,11 +670,8 @@ class GreenFoxServer:
         return send_fn
 
     def run(self):
-        # start TCP accept thread
         threading.Thread(target=self._tcp_accept_loop, daemon=True).start()
-        # start tun->client loop
         threading.Thread(target=self._tun_loop, daemon=True).start()
-        # main UDP receive loop
         while True:
             try:
                 data, addr = self.udp_sock.recvfrom(65535)
@@ -698,11 +687,9 @@ class GreenFoxServer:
     def _handle_tcp_connection(self, conn: socket.socket, addr: Tuple[str, int]):
         peer_key = self._addr_key(addr, 'tcp')
         send_fn = self._tcp_send_factory(conn, addr)
-        # register a dummy entry so tun_loop can use send
         self.sessions[peer_key] = (None, send_fn)
         try:
             while True:
-                # read 2-byte length
                 l = conn.recv(2)
                 if not l:
                     break
@@ -728,9 +715,7 @@ class GreenFoxServer:
 
     def _handle_incoming(self, data: bytes, addr: Tuple[str, int], proto: str='udp', tcp_conn: Optional[socket.socket]=None):
         addr_key = self._addr_key(addr, proto)
-        # handshake detection
         if addr_key not in self.sessions:
-            # expecting handshake
             if data.startswith(b'HANDSHAKE:'):
                 client_pub = data[len(b'HANDSHAKE:'):]
                 try:
@@ -738,32 +723,24 @@ class GreenFoxServer:
                 except Exception:
                     print('[SERVER] Received invalid client pubkey during handshake')
                     return
-                # compute shared, derive key and sid
                 shared = x25519_derive(self.priv, client_x)
                 sid_int = int.from_bytes(PySHA256.new(shared).digest()[:4], 'big')
                 session = GreenFoxSession(shared, sid_int)
-                # choose send function
                 if proto == 'udp':
                     send_fn = lambda d, a=addr: self._udp_send(a, d)
                 else:
-                    # tcp_conn present
                     send_fn = self._tcp_send_factory(tcp_conn, addr)
                 self.sessions[addr_key] = (session, send_fn)
-                # sign server pub || client pub to prove server identity
                 server_pub_raw = x25519_pub_to_bytes(self.pub)
                 sig = sign_bytes(self.ecdsa_priv, server_pub_raw + client_pub)
-                # send: PUBKEY:<server_pub_raw>:SIG:<sig>
                 pkt = b'PUBKEY:' + server_pub_raw + b':SIG:' + sig
                 send_fn(pkt)
                 print(f"[SERVER] Handshake complete: {addr} (proto={proto})")
                 return
             else:
-                # unknown peer and not handshake -> drop
                 return
-        # existing session: decrypt
         session, send_fn = self.sessions.get(addr_key, (None, None))
         if session is None:
-            # missing session yet (race) -> drop
             return
         try:
             plain = session.decrypt(data)
@@ -776,7 +753,6 @@ class GreenFoxServer:
     def _tun_loop(self):
         while True:
             packet = os.read(self.tun, MAX_PACKET)
-            # broadcast to all active sessions (simple model)
             for addr_key, (session, send_fn) in list(self.sessions.items()):
                 if session is None or send_fn is None:
                     continue
@@ -786,9 +762,7 @@ class GreenFoxServer:
                 except Exception as e:
                     print(f"[SERVER] Error sending to {addr_key}: {e}")
 
-
 # --- Arg parsing & helpers to build transports ---
-
 def build_transport_stack_from_args(args, mode, server, port):
     stack = []
     if getattr(args, 'obfs4', None):
@@ -803,11 +777,9 @@ def build_transport_stack_from_args(args, mode, server, port):
     stack.append(('udp', lambda: UDPTransport((server, port))))
     return stack
 
-
 def parse_args():
     parser = ArgumentParser(description="GreenFox VPN Protocol - Hardened")
     subparsers = parser.add_subparsers(dest='mode', help="server/client")
-    # Server mode
     sp_srv = subparsers.add_parser('server')
     sp_srv.add_argument('port', type=int, help="Listen port")
     sp_srv.add_argument('--obfs4', help="obfs4 bridge (ip:port)")
@@ -817,7 +789,6 @@ def parse_args():
     sp_srv.add_argument('--torhost', default="127.0.0.1", help="Tor SOCKS5 host")
     sp_srv.add_argument('--torport', type=int, default=9050, help="Tor SOCKS5 port")
     sp_srv.add_argument('--tun', default='tun0', help="TUN device name")
-    # Client mode
     sp_cli = subparsers.add_parser('client')
     sp_cli.add_argument('server', help="Server address")
     sp_cli.add_argument('port', type=int, help="Server port")
@@ -829,12 +800,59 @@ def parse_args():
     sp_cli.add_argument('--tor', action='store_true', help="Enable Tor fallback")
     sp_cli.add_argument('--torhost', default="127.0.0.1", help="Tor SOCKS5 host")
     sp_cli.add_argument('--torport', type=int, default=9050, help="Tor SOCKS5 port")
+    sp_cli.add_argument('--tor-trans', help='Enable serverless transparent Tor mode; format: container_ip|docker-host[:trans_port[:dns_port]]')
     sp_cli.add_argument('--tun', default='tun1', help="TUN device name")
     return parser.parse_args()
 
-
 if __name__ == "__main__":
     args = parse_args()
+
+    # Tor-transparent helper mode (client)
+    if args.mode == 'client' and getattr(args, 'tor_trans', None):
+        # tor-trans argument: either 'docker-host' meaning start container on this host with host-network,
+        # or an IP (remote VM/container). Optional ports: ip:trans_port:dns_port
+        parts = args.tor_trans.split(':')
+        cont_ip = parts[0]
+        trans_port = int(parts[1]) if len(parts) > 1 and parts[1] else 9040
+        dns_port = int(parts[2]) if len(parts) > 2 and parts[2] else 53
+        print(f"[MAIN] Starting client in Tor-transparent mode -> {cont_ip}:{trans_port} (dns {dns_port})")
+        check_root()
+        tun = args.tun
+        tun_fd = tun_alloc(tun, auto_up=True, ip="10.8.0.2/24")
+        save_default_route()
+        save_resolv_conf()
+        set_default_route_via_tun(tun)
+        enable_ip_forwarding()
+
+        if cont_ip in ('docker-host', 'auto'):
+            os.makedirs(_TOR_TMPDIR, exist_ok=True)
+            torrc_path = os.path.join(_TOR_TMPDIR, 'torrc')
+            prepare_torrc(torrc_path, trans_port=trans_port, dns_port=dns_port)
+            ok = run_tor_container_hostnet(torrc_path)
+            if not ok:
+                print('[MAIN] Failed to start tor container. Exiting.')
+                cleanup_and_exit()
+            container_ip_used = '127.0.0.1'
+            hostnet_mode = True
+            atexit.register(stop_tor_container)
+            signal.signal(signal.SIGINT, lambda s,f: (stop_tor_container(), cleanup_and_exit(s,f)))
+            signal.signal(signal.SIGTERM, lambda s,f: (stop_tor_container(), cleanup_and_exit(s,f)))
+        else:
+            container_ip_used = cont_ip
+            hostnet_mode = False
+
+        enable_tor_transparent(container_ip=container_ip_used, trans_port=trans_port, dns_port=dns_port, tun=tun, hostnet=hostnet_mode)
+        print("[MAIN] Tor-transparent mode active. Press Ctrl-C to exit.")
+        try:
+            while True:
+                time.sleep(10)
+        except KeyboardInterrupt:
+            disable_tor_transparent()
+            if cont_ip in ('docker-host', 'auto'):
+                stop_tor_container()
+            cleanup_and_exit()
+
+    # Normal server/client flows
     if args.mode == "server":
         s = GreenFoxServer(
             port=args.port,
@@ -842,7 +860,6 @@ if __name__ == "__main__":
         )
         s.run()
     elif args.mode == "client":
-        # read optional server ecdsa pub
         server_ecdsa_pub = None
         if getattr(args, 'server_ecdsa_pub', None):
             if os.path.exists(args.server_ecdsa_pub):
@@ -862,5 +879,5 @@ if __name__ == "__main__":
     else:
         print("Usage:")
         print("  sudo python3 greenfox_protocol_fixed.py server <port> [--obfs4 ...] [--front ...] [--meek ...] [--tor]")
-        print("  sudo python3 greenfox_protocol_fixed.py client <server> <port> <server_pub_hex> [--server_ecdsa_pub <path_or_pem>] [--obfs4 ...] [--front ...] [--meek ...] [--tor]")
+        print("  sudo python3 greenfox_protocol_fixed.py client <server> <port> <server_pub_hex> [--server_ecdsa_pub <path_or_pem>] [--obfs4 ...] [--front ...] [--meek ...] [--tor] [--tor-trans docker-host|<ip>[:trans_port[:dns_port]]]")
         sys.exit(1)
