@@ -878,6 +878,6 @@ if __name__ == "__main__":
         c.run()
     else:
         print("Usage:")
-        print("  sudo python3 greenfox_protocol_fixed.py server <port> [--obfs4 ...] [--front ...] [--meek ...] [--tor]")
-        print("  sudo python3 greenfox_protocol_fixed.py client <server> <port> <server_pub_hex> [--server_ecdsa_pub <path_or_pem>] [--obfs4 ...] [--front ...] [--meek ...] [--tor] [--tor-trans docker-host|<ip>[:trans_port[:dns_port]]]")
+        print("  sudo python3 Protocol.py server <port> [--obfs4 ...] [--front ...] [--meek ...] [--tor]")
+        print("  sudo python3 Protocol.py client <server> <port> <server_pub_hex> [--server_ecdsa_pub <path_or_pem>] [--obfs4 ...] [--front ...] [--meek ...] [--tor] [--tor-trans docker-host|<ip>[:trans_port[:dns_port]]]")
         sys.exit(1)
