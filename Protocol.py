@@ -154,30 +154,20 @@ def morph_traffic():
     return b''
 
 def antigravity_bypass():
-    """Antigravity-specific censorship bypass: randomize request patterns and add decoys.
+    """Antigravity-specific censorship bypass: randomize request patterns and add timing variance.
     Iran's Antigravity censorship may detect:
     - Connection patterns to known Google IPs
     - TLS ClientHello fingerprints
     - HTTP header sequences
     - Traffic volume signatures
     """
-    techniques = []
-    
-    # 1. Random request ordering (avoid signature patterns)
+    # 1. Random request ordering (avoid signature patterns) - via jitter
     if random.random() < 0.3:
-        return random.choice([
-            b'HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n',  # Decoy HEAD request
-            b'TRACE / HTTP/1.1\r\nHost: example.com\r\n\r\n',   # Decoy TRACE request
-            b'CONNECT example.com:443 HTTP/1.1\r\n\r\n'         # Decoy CONNECT tunnel
-        ])
+        anti_dpi_jitter()  # Extra jitter at random times
     
     # 2. Random delays between operations
     if RANDOMIZE_DELAYS:
         time.sleep(random.uniform(0.01, 0.1))
-    
-    # 3. Send decoy packets to random addresses
-    if random.random() < DECOY_PACKET_RATIO:
-        add_decoy_packet(None, None)
     
     return None
 
@@ -605,6 +595,13 @@ class MultiTransport:
 class GreenFoxClient:
     def __init__(self, server, port, server_pub_hex, server_ecdsa_pub=None, tun_name='tun1', cert_pin_sha256=None):
         self.tun = tun_alloc(tun_name, auto_up=True, ip=f"10.8.0.2/24")
+        self.tun_name = tun_name
+        
+        # Set TUN device to non-blocking mode
+        import fcntl
+        flags = fcntl.fcntl(self.tun, fcntl.F_GETFL)
+        fcntl.fcntl(self.tun, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
         save_default_route()
         save_resolv_conf()
         set_default_route_via_tun(tun_name)
@@ -643,13 +640,34 @@ class GreenFoxClient:
         self.handshake()
         
         def tun_reader():
+            consecutive_errors = 0
             while True:
                 try:
-                    packet = os.read(self.tun, MAX_READ_SIZE)
-                    if not packet: continue
+                    try:
+                        packet = os.read(self.tun, MAX_READ_SIZE)
+                    except BlockingIOError:
+                        # No data available in non-blocking mode; sleep briefly
+                        time.sleep(0.001)
+                        consecutive_errors = 0
+                        continue
+                    
+                    if not packet:
+                        consecutive_errors = 0
+                        continue
+                    
+                    consecutive_errors = 0
                     wrapped = ucp_wrap(packet)
                     self.transport.send(self.session.encrypt(wrapped))
-                except Exception: break
+                except OSError as e:
+                    # Handle TUN device read errors gracefully
+                    consecutive_errors += 1
+                    if consecutive_errors > 100:
+                        print(f"[TUN] Too many errors, closing TUN reader")
+                        break
+                    time.sleep(0.01)
+                except Exception as e:
+                    print(f"[TUN] Error in tun_reader: {e}")
+                    break
         
         threading.Thread(target=tun_reader, daemon=True).start()
         
