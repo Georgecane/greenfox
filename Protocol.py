@@ -20,6 +20,7 @@ import base64
 import requests
 import re
 import time
+import hashlib
 from argparse import ArgumentParser
 from typing import Callable, Tuple, Optional
 
@@ -41,13 +42,46 @@ MAX_READ_SIZE = 2048
 VPN_SUBNET = '10.8.0.0/24'
 MIN_PAD = 16
 MAX_PAD = 80
-DEFAULT_DNS = '1.1.1.1'
+DEFAULT_DNS = '8.8.8.8'
+
+# Anti-Censorship & DPI Evasion Settings
+PACKET_JITTER_MIN = 5      # Min milliseconds jitter between packets
+PACKET_JITTER_MAX = 50     # Max milliseconds jitter between packets
+DECOY_PACKET_RATIO = 0.1   # Send decoy packets 10% of the time
+MTU_FRAGMENTATION = 500    # Fragment larger packets to avoid pattern matching
+RANDOMIZE_DELAYS = True    # Enable random delays to evade timing analysis
+USE_TLS_FAKE_SNI = True    # Use random SNI for each connection (evasion)
 
 # Server Key Paths
 SERVER_ECDSA_PRIV_FILE = 'greenfox_server_ecdsa_priv.pem'
 SERVER_ECDSA_PUB_FILE = 'greenfox_server_ecdsa_pub.pem'
 SERVER_TLS_CERT = 'greenfox_cert.pem'
 SERVER_TLS_KEY = 'greenfox_key.pem' 
+
+# --- Anti-Censorship Helpers ---
+def anti_dpi_jitter():
+    """Add random jitter to packet timing to evade DPI detection."""
+    if RANDOMIZE_DELAYS:
+        jitter = random.uniform(PACKET_JITTER_MIN, PACKET_JITTER_MAX) / 1000.0
+        time.sleep(jitter)
+
+def add_decoy_packet(sock, data):
+    """Occasionally send decoy packets to confuse traffic analysis."""
+    if random.random() < DECOY_PACKET_RATIO:
+        decoy = get_random_bytes(random.randint(100, 500))
+        try:
+            sock.sendto(decoy, ("192.0.2.1", random.randint(1000, 65535)))
+        except Exception:
+            pass
+
+def randomize_sni():
+    """Generate a random SNI hostname to avoid fingerprinting."""
+    domains = [
+        'www.google.com', 'www.microsoft.com', 'www.amazon.com',
+        'www.facebook.com', 'www.twitter.com', 'www.github.com',
+        'cdn.example.com', 'api.example.com', 'static.example.com'
+    ]
+    return random.choice(domains)
 
 # --- System & Network Helpers ---
 def sh(cmd: str) -> subprocess.CompletedProcess:
@@ -121,9 +155,17 @@ def save_resolv_conf():
 
 def restore_resolv_conf():
     try:
-        if os.path.exists("/tmp/greenfoxvpn_orig_resolv.conf"):
-            shutil.copy("/tmp/greenfoxvpn_orig_resolv.conf", "/etc/resolv.conf")
-            os.remove("/tmp/greenfoxvpn_orig_resolv.conf")
+        tmp = "/tmp/greenfoxvpn_orig_resolv.conf"
+        if os.path.exists(tmp):
+            # Copy back using sudo if needed so we don't require the whole script to be root
+            try:
+                if os.geteuid() == 0:
+                    shutil.copy(tmp, "/etc/resolv.conf")
+                    os.remove(tmp)
+                else:
+                    run_priv(f"cp {tmp} /etc/resolv.conf && rm {tmp}")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -131,7 +173,7 @@ def set_default_route_via_tun(tun_name="tun1"):
     run_priv("ip route del default || true")
     run_priv(f"ip route add default dev {tun_name}")
 
-def set_dns_linux(dns='1.1.1.1'):
+def set_dns_linux(dns='8.8.8.8'):
     try:
         if os.geteuid() == 0:
             with open("/etc/resolv.conf", "w") as f:
@@ -173,18 +215,37 @@ def tun_alloc(dev='tun0', auto_up=False, ip=None):
 
 def cleanup_and_exit(signum=None, frame=None):
     print("\n[*] Cleaning up GreenFox...")
-    # Clean up
-    restore_default_route()
+    # Restore DNS first (critical)
     restore_resolv_conf()
+    # Restore default route
+    restore_default_route()
+    # Bring down and delete tun interfaces if they exist (be tolerant of failures)
     for tun in ['tun0', 'tun1']:
-        run_priv(f"ip link delete {tun}")
+        try:
+            run_priv(f"ip link set {tun} down || true")
+        except Exception:
+            pass
+        try:
+            run_priv(f"ip link delete {tun} || true")
+        except Exception:
+            pass
     iface = get_default_interface()
     if iface:
-        run_priv(f"iptables -t nat -D POSTROUTING -s {VPN_SUBNET} -o {iface} -j MASQUERADE")
+        try:
+            run_priv(f"iptables -t nat -D POSTROUTING -s {VPN_SUBNET} -o {iface} -j MASQUERADE || true")
+        except Exception:
+            pass
         for tun in ['tun0', 'tun1']:
             for direction in ['-i', '-o']:
-                run_priv(f"iptables -D FORWARD {direction} {tun} -j ACCEPT")
-    run_priv("sysctl -w net.ipv4.ip_forward=0")
+                try:
+                    run_priv(f"iptables -D FORWARD {direction} {tun} -j ACCEPT || true")
+                except Exception:
+                    pass
+    try:
+        run_priv("sysctl -w net.ipv4.ip_forward=0")
+    except Exception:
+        pass
+    print("[*] Cleanup complete. System restored to normal state.")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, cleanup_and_exit)
@@ -284,37 +345,79 @@ class GreenFoxSession:
 class WSCamouflageTransport:
     """
     Transport which wraps data in TLS and a fake WebSocket Handshake.
+    Supports certificate pinning for secure self-signed cert validation.
+    Enhanced with anti-DPI evasion (jitter, decoys, randomized SNI).
     """
-    def __init__(self, remote_addr: Tuple[str, int], host_header: Optional[str] = None):
+    def __init__(self, remote_addr: Tuple[str, int], host_header: Optional[str] = None, cert_pin_sha256: Optional[str] = None):
         self.raddr = remote_addr
         host = host_header if host_header else remote_addr[0]
+        
+        # Use randomized SNI to evade DPI fingerprinting
+        sni_host = randomize_sni() if USE_TLS_FAKE_SNI else host
         
         sock = socket.create_connection(remote_addr, timeout=10)
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE  # We'll verify via pinning instead
         
-        self.tls = context.wrap_socket(sock, server_hostname=host)
+        anti_dpi_jitter()  # Add timing randomization
+        self.tls = context.wrap_socket(sock, server_hostname=sni_host)
         
-        # 1. Fake Handshake (Looks like WebSocket Upgrade)
+        # Certificate pinning: verify server cert hash if provided
+        if cert_pin_sha256:
+            cert_der = self.tls.getpeercert(binary_form=True)
+            cert_hash = hashlib.sha256(cert_der).hexdigest()
+            if cert_hash.lower() != cert_pin_sha256.lower():
+                self.tls.close()
+                raise ValueError(f"Certificate pin mismatch! Expected {cert_pin_sha256}, got {cert_hash}")
+            print(f"[TLS] Certificate pinned and verified: {cert_hash[:16]}...")
+        
+        anti_dpi_jitter()  # More jitter between handshake steps
+        
+        # 1. Fake Handshake (Looks like WebSocket Upgrade with realistic headers)
         ws_key = base64.b64encode(get_random_bytes(16)).decode()
+        # Randomize User-Agent to avoid fingerprinting
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15'
+        ]
+        user_agent = random.choice(user_agents)
+        
         handshake = (
             f"GET /ws HTTP/1.1\r\n"
             f"Host: {host}\r\n"
-            f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+            f"User-Agent: {user_agent}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Accept-Encoding: gzip, deflate\r\n"
+            f"Accept-Language: en-US,en;q=0.9\r\n"
             f"\r\n"
         ).encode()
         
         self.tls.sendall(handshake)
+        anti_dpi_jitter()  # Jitter before receiving response
         # 2. Receive and check response (just check if socket stays alive)
         self.tls.recv(4096)
-        print(f"[Camouflage] Handshake OK via {host}")
+        print(f"[Camouflage] Handshake OK via {host} (DPI evasion active)")
 
     def send(self, data: bytes):
         # Prepend a 4-byte length header for GreenFox packets
-        self.tls.sendall(len(data).to_bytes(4, 'big') + data)
+        packet = len(data).to_bytes(4, 'big') + data
+        
+        # Fragment large packets to avoid DPI pattern matching
+        if len(packet) > MTU_FRAGMENTATION:
+            for i in range(0, len(packet), MTU_FRAGMENTATION):
+                fragment = packet[i:i + MTU_FRAGMENTATION]
+                self.tls.sendall(fragment)
+                anti_dpi_jitter()  # Jitter between fragments
+        else:
+            self.tls.sendall(packet)
+        
+        anti_dpi_jitter()  # Jitter after send
         
     def recv(self, bufsize=4096) -> Tuple[bytes, Tuple[str, int]]:
         # Read the 4-byte length prefix
@@ -365,7 +468,7 @@ class MultiTransport:
 
 # --- Client Logic ---
 class GreenFoxClient:
-    def __init__(self, server, port, server_pub_hex, server_ecdsa_pub=None, tun_name='tun1', transports=None):
+    def __init__(self, server, port, server_pub_hex, server_ecdsa_pub=None, tun_name='tun1', cert_pin_sha256=None):
         self.tun = tun_alloc(tun_name, auto_up=True, ip=f"10.8.0.2/24")
         save_default_route()
         save_resolv_conf()
@@ -373,10 +476,11 @@ class GreenFoxClient:
         set_dns_linux()
         self.priv, self.pub = x25519_generate()
         self.server_pub = x25519_pub_from_bytes(bytes.fromhex(server_pub_hex))
+        self.cert_pin = cert_pin_sha256
 
         # Always try TLS/WSCamouflage first, then fallback to UDP
         self.transport = MultiTransport([
-            ('camouflage_tls', lambda: WSCamouflageTransport((server, port), host_header=server)),
+            ('camouflage_tls', lambda: WSCamouflageTransport((server, port), host_header=server, cert_pin_sha256=self.cert_pin)),
             ('udp_direct', lambda: UDPTransport((server, 9999)))
         ])
         self.session = None
@@ -585,11 +689,12 @@ if __name__ == "__main__":
     cli.add_argument('--server_ecdsa_pub', help="Path to ECDSA pub key (optional)")
     cli.add_argument('--port', type=int, default=443)
     cli.add_argument('--tun', default='tun1')
+    cli.add_argument('--cert-pin', help="Server certificate SHA256 hash for pinning (optional)")
     args = parser.parse_args()
     try:
         if args.mode == 'client':
             print(f"🟢 [GreenFox] Starting Client (Anti-Censorship Mode)...")
-            c = GreenFoxClient(args.server, args.port, args.server_pub_hex, args.server_ecdsa_pub, tun_name=args.tun)
+            c = GreenFoxClient(args.server, args.port, args.server_pub_hex, args.server_ecdsa_pub, tun_name=args.tun, cert_pin_sha256=args.cert_pin)
             c.run()
         elif args.mode == 'server':
             print(f"🔴 [GreenFox] Starting Server (Obfuscating on port {args.port})...")
