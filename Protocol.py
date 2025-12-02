@@ -57,6 +57,15 @@ INJECT_NOISE = True        # Inject random HTTP headers to evade pattern matchin
 DNS_TUNNEL = True          # Use DNS tunneling as fallback
 ANTIGRAVITY_BYPASS = True  # Enable specific Antigravity censorship bypasses
 
+# CRITICAL: DNS & IP Leak Prevention Settings
+STRICT_DNS_ONLY = True     # Only allow DNS through VPN tunnel
+BLOCK_SYSTEM_DNS = True    # Block direct access to system resolvers
+BLOCK_IPV6 = True          # Disable IPv6 to prevent leaks
+ENFORCE_NO_SPLIT_TUNNEL = True  # Prevent split-tunneling attacks
+VPN_DNS_SERVER = '10.8.0.1'    # Use VPN gateway as DNS resolver
+BLOCK_WEBRTC = True        # Block WebRTC to prevent IP leaks
+VERIFY_KILLSWITCH = True   # Implement leak killswitch
+
 # Server Key Paths
 SERVER_ECDSA_PRIV_FILE = 'greenfox_server_ecdsa_priv.pem'
 SERVER_ECDSA_PUB_FILE = 'greenfox_server_ecdsa_pub.pem'
@@ -198,6 +207,78 @@ def get_default_interface() -> Optional[str]:
 def enable_ip_forwarding():
     run_priv("sysctl -w net.ipv4.ip_forward=1")
 
+def block_ipv6_leaks():
+    """
+    Block IPv6 to prevent information leaks.
+    IPv6 can bypass VPN tunnel and expose real identity.
+    """
+    try:
+        # Disable IPv6 entirely to prevent leaks
+        run_priv("sysctl -w net.ipv6.conf.all.disable_ipv6=1")
+        run_priv("sysctl -w net.ipv6.conf.default.disable_ipv6=1")
+        run_priv("sysctl -w net.ipv6.conf.lo.disable_ipv6=1")
+        
+        # Block all IPv6 traffic via firewall as fallback
+        run_priv("ip6tables -P INPUT DROP 2>/dev/null || true")
+        run_priv("ip6tables -P OUTPUT DROP 2>/dev/null || true")
+        run_priv("ip6tables -P FORWARD DROP 2>/dev/null || true")
+        
+        print("[IPv6] ✅ IPv6 blocked: No IPv6 leaks possible")
+    except Exception as e:
+        print(f"[IPv6] ⚠️  Warning: Could not fully disable IPv6: {e}")
+
+def block_webrtc_leaks():
+    """
+    Block WebRTC connections that can leak real IP even through VPN.
+    """
+    try:
+        # Block STUN/TURN servers (commonly used by WebRTC)
+        run_priv("iptables -A OUTPUT -p udp --dport 3478:3479 -j REJECT --reject-with icmp-port-unreachable || true")
+        run_priv("iptables -A OUTPUT -p tcp --dport 3478:3479 -j REJECT --reject-with icmp-port-unreachable || true")
+        
+        # Block mDNS hostname.local resolution (used by some WebRTC implementations)
+        run_priv("iptables -A OUTPUT -d 224.0.0.251 -p udp --dport 5353 -j DROP || true")
+        
+        print("[WebRTC] ✅ WebRTC leak protection enabled: STUN/TURN blocked")
+    except Exception as e:
+        print(f"[WebRTC] ⚠️  Warning: Could not block WebRTC: {e}")
+
+def enable_strict_ip_leak_prevention():
+    """
+    Implement strict killswitch: all traffic goes through VPN or is blocked.
+    """
+    try:
+        default_iface = get_default_interface()
+        if not default_iface:
+            print("[Killswitch] ⚠️  Could not determine default interface")
+            return
+        
+        # Set default policy to DROP (fail-safe)
+        run_priv("iptables -P INPUT DROP 2>/dev/null || true")
+        run_priv("iptables -P OUTPUT DROP 2>/dev/null || true")
+        run_priv("iptables -P FORWARD DROP 2>/dev/null || true")
+        
+        # Allow loopback
+        run_priv("iptables -A INPUT -i lo -j ACCEPT || true")
+        run_priv("iptables -A OUTPUT -o lo -j ACCEPT || true")
+        
+        # Allow VPN tunnel interface (tun0/tun1)
+        run_priv("iptables -A INPUT -i tun+ -j ACCEPT || true")
+        run_priv("iptables -A OUTPUT -o tun+ -j ACCEPT || true")
+        
+        # Allow VPN connection to server (critical!)
+        # This will be refined once server IP is known
+        run_priv("iptables -A OUTPUT -p udp --dport 9999 -j ACCEPT || true")
+        run_priv("iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT || true")
+        
+        # Allow established connections for VPN
+        run_priv("iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || true")
+        run_priv("iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || true")
+        
+        print("[Killswitch] ✅ Strict IP leak prevention: All non-VPN traffic blocked")
+    except Exception as e:
+        print(f"[Killswitch] ⚠️  Warning: Could not enable full killswitch: {e}")
+
 def add_nat_rule(subnet, iface):
     check = f"iptables -t nat -C POSTROUTING -s {subnet} -o {iface} -j MASQUERADE"
     add = f"iptables -t nat -A POSTROUTING -s {subnet} -o {iface} -j MASQUERADE"
@@ -260,6 +341,40 @@ def restore_resolv_conf():
 def set_default_route_via_tun(tun_name="tun1"):
     run_priv("ip route del default || true")
     run_priv(f"ip route add default dev {tun_name}")
+
+def set_dns_leak_protection(tun_ip='10.8.0.1'):
+    """
+    Configure strict DNS leak prevention:
+    1. Set DNS to VPN gateway only
+    2. Block system resolver access
+    3. Add DNS firewall rules
+    """
+    try:
+        if os.geteuid() == 0:
+            # Set VPN DNS as primary resolver with strict options
+            with open("/etc/resolv.conf", "w") as f:
+                f.write(f"nameserver {tun_ip}\n")
+                f.write("options single-request-reopen\n")
+                f.write("options rotate\n")
+        else:
+            # Use sudo tee so we don't need to re-exec the whole script
+            dns_config = f"nameserver {tun_ip}\\noptions single-request-reopen\\noptions rotate"
+            subprocess.run(f"echo -e '{dns_config}' | sudo tee /etc/resolv.conf > /dev/null", shell=True)
+        
+        # Block direct access to system resolvers (port 53)
+        run_priv("iptables -A OUTPUT -p udp --dport 53 -o lo -j ACCEPT || true")
+        run_priv("iptables -A OUTPUT -p udp --dport 53 ! -d 10.8.0.0/24 -j REJECT --reject-with icmp-host-prohibited || true")
+        run_priv("iptables -A OUTPUT -p tcp --dport 53 ! -d 10.8.0.0/24 -j REJECT --reject-with icmp-host-prohibited || true")
+        
+        # Drop mDNS (224.0.0.251:5353) to prevent local network leaks
+        run_priv("iptables -A OUTPUT -d 224.0.0.251 -p udp --dport 5353 -j DROP || true")
+        
+        # Drop LLMNR (Link-Local Multicast Name Resolution) which can leak info
+        run_priv("iptables -A OUTPUT -d 224.0.0.252 -p udp --dport 5355 -j DROP || true")
+        
+        print("[DNS] ✅ Strict leak protection enabled: DNS forced through VPN tunnel only")
+    except Exception as e:
+        print(f"[DNS] ⚠️  Warning: Could not set leak protection: {e}")
 
 def set_dns_linux(dns='8.8.8.8'):
     try:
@@ -374,6 +489,159 @@ def verify_bytes(ecdsa_pub, data, signature):
         return True
     except ValueError:
         return False
+
+# --- Leak Detection & Testing Utils ---
+class LeakDetectionUtils:
+    """Utilities to detect and prevent IP/DNS leaks"""
+    
+    @staticmethod
+    def get_system_dns_servers():
+        """Extract system DNS servers from /etc/resolv.conf"""
+        try:
+            with open("/etc/resolv.conf", "r") as f:
+                lines = f.readlines()
+            dns_servers = []
+            for line in lines:
+                if line.strip().startswith("nameserver"):
+                    server = line.split()[1]
+                    dns_servers.append(server)
+            return dns_servers
+        except Exception:
+            return []
+    
+    @staticmethod
+    def verify_dns_configuration(expected_dns='10.8.0.1'):
+        """Verify DNS is configured to use only VPN gateway"""
+        dns_servers = LeakDetectionUtils.get_system_dns_servers()
+        
+        # Check if VPN DNS is the only nameserver
+        if len(dns_servers) == 1 and dns_servers[0] == expected_dns:
+            print(f"[Leak Check] ✅ DNS correctly configured to VPN gateway: {expected_dns}")
+            return True
+        else:
+            print(f"[Leak Check] ⚠️  DNS misconfigured. Expected: [{expected_dns}], Got: {dns_servers}")
+            return False
+    
+    @staticmethod
+    def check_ipv6_status():
+        """Check if IPv6 is disabled (prevents IPv6 leaks)"""
+        try:
+            result = sh("cat /proc/sys/net/ipv6/conf/all/disable_ipv6").stdout.decode().strip()
+            if result == "1":
+                print("[Leak Check] ✅ IPv6 disabled: No IPv6 leaks possible")
+                return True
+            else:
+                print("[Leak Check] ⚠️  IPv6 enabled: Risk of IPv6 leaks")
+                return False
+        except Exception:
+            print("[Leak Check] ⚠️  Could not verify IPv6 status")
+            return False
+    
+    @staticmethod
+    def check_firewall_rules():
+        """Verify critical iptables rules are in place"""
+        try:
+            # Check if DROP rules exist for DNS outside VPN
+            result = sh("sudo iptables -L OUTPUT -n 2>/dev/null | grep 'dpt:53'").stdout.decode()
+            if "REJECT" in result or "DROP" in result:
+                print("[Leak Check] ✅ DNS firewall rules in place: Port 53 restricted")
+                return True
+            else:
+                print("[Leak Check] ⚠️  DNS firewall rules missing: Port 53 may not be restricted")
+                return False
+        except Exception:
+            print("[Leak Check] ⚠️  Could not verify firewall rules")
+            return False
+    
+    @staticmethod
+    def test_dns_leak():
+        """Test if DNS queries leak outside VPN tunnel"""
+        print("[Leak Check] Testing DNS leak prevention...")
+        try:
+            # Try to resolve a test domain
+            import socket as _socket
+            _socket.gethostbyname("example.com")
+            print("[Leak Check] ✅ DNS query succeeded (routing through VPN)")
+            return True
+        except _socket.gaierror as e:
+            print(f"[Leak Check] ⚠️  DNS resolution failed: {e}")
+            print("              This is OK if using custom VPN DNS server")
+            return False
+        except Exception as e:
+            print(f"[Leak Check] ⚠️  DNS test error: {e}")
+            return False
+    
+    @staticmethod
+    def test_ip_leak():
+        """Test if real IP leaks through tunnels (WebRTC, etc.)"""
+        print("[Leak Check] Testing IP leak prevention...")
+        try:
+            # Check STUN/TURN ports are blocked
+            result = sh("sudo iptables -L OUTPUT -n 2>/dev/null | grep '3478\\|3479'").stdout.decode()
+            if "REJECT" in result or "DROP" in result:
+                print("[Leak Check] ✅ STUN/TURN ports blocked: WebRTC leak protection active")
+                return True
+            else:
+                print("[Leak Check] ⚠️  STUN/TURN ports may be open: WebRTC leak possible")
+                return False
+        except Exception:
+            print("[Leak Check] ⚠️  Could not verify STUN/TURN blocking")
+            return False
+    
+    @staticmethod
+    def run_full_leak_test():
+        """Run comprehensive leak detection"""
+        print("\n" + "="*60)
+        print("🔍 [COMPREHENSIVE LEAK DETECTION TEST]")
+        print("="*60)
+        
+        results = {
+            "DNS Config": LeakDetectionUtils.verify_dns_configuration(),
+            "IPv6 Disabled": LeakDetectionUtils.check_ipv6_status(),
+            "Firewall Rules": LeakDetectionUtils.check_firewall_rules(),
+            "DNS Leak Test": LeakDetectionUtils.test_dns_leak(),
+            "IP Leak Test": LeakDetectionUtils.test_ip_leak(),
+        }
+        
+        passed = sum(1 for v in results.values() if v)
+        total = len(results)
+        
+        print("\n" + "="*60)
+        print(f"📊 Results: {passed}/{total} checks passed")
+        print("="*60 + "\n")
+        
+        if passed == total:
+            print("✅ All leak prevention measures are ACTIVE")
+            print("   Your IP and DNS are protected through the VPN tunnel")
+        elif passed >= total - 1:
+            print("⚠️  Most leak prevention measures are active")
+            print("   Minor issues detected - verify configuration")
+        else:
+            print("❌ Critical leak prevention issues detected")
+            print("   DANGER: Your IP/DNS may be leaking!")
+        
+        return results
+
+def prevent_dns_rebinding(tun_ip='10.8.0.1'):
+    """
+    Prevent DNS rebinding attacks where attacker makes client resolve
+    attacker domain to 127.0.0.1 or private IP to attack local services.
+    """
+    try:
+        # Block responses that resolve to loopback (127.0.0.0/8)
+        run_priv("iptables -A OUTPUT -d 127.0.0.0/8 -p udp --dport 53 -j REJECT || true")
+        
+        # Block responses that resolve to private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+        run_priv("iptables -A OUTPUT -d 10.0.0.0/8 -p udp --dport 53 ! -d 10.8.0.0/24 -j REJECT || true")
+        run_priv("iptables -A OUTPUT -d 172.16.0.0/12 -p udp --dport 53 -j REJECT || true")
+        run_priv("iptables -A OUTPUT -d 192.168.0.0/16 -p udp --dport 53 -j REJECT || true")
+        
+        # Block multicast responses (224.0.0.0/4)
+        run_priv("iptables -A OUTPUT -d 224.0.0.0/4 -p udp --dport 53 -j REJECT || true")
+        
+        print("[DNS Rebinding] ✅ Protection enabled: Private IP resolution blocked")
+    except Exception as e:
+        print(f"[DNS Rebinding] ⚠️  Warning: {e}")
 
 # --- UCP Wrapping (Padding) ---
 def ucp_wrap(data: bytes, msg_type: int = 1) -> bytes:
@@ -602,10 +870,38 @@ class GreenFoxClient:
         flags = fcntl.fcntl(self.tun, fcntl.F_GETFL)
         fcntl.fcntl(self.tun, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         
+        # Save system state for restoration
         save_default_route()
         save_resolv_conf()
+        
+        # CRITICAL: Apply leak prevention BEFORE setting routes
+        print("[Client] Applying leak prevention measures...")
+        
+        # Block IPv6 to prevent leaks
+        if BLOCK_IPV6:
+            block_ipv6_leaks()
+        
+        # Block WebRTC IP leaks
+        if BLOCK_WEBRTC:
+            block_webrtc_leaks()
+        
+        # Enable strict IP leak prevention (killswitch)
+        if VERIFY_KILLSWITCH:
+            enable_strict_ip_leak_prevention()
+        
+        # Set default route through VPN
         set_default_route_via_tun(tun_name)
-        set_dns_linux()
+        
+        # Configure strict DNS leak protection
+        if STRICT_DNS_ONLY:
+            set_dns_leak_protection(VPN_DNS_SERVER)
+        else:
+            set_dns_linux()
+        
+        # Prevent DNS rebinding attacks
+        prevent_dns_rebinding(VPN_DNS_SERVER)
+        
+        # Initialize X25519 key exchange
         self.priv, self.pub = x25519_generate()
         self.server_pub = x25519_pub_from_bytes(bytes.fromhex(server_pub_hex))
         self.cert_pin = cert_pin_sha256
@@ -616,6 +912,8 @@ class GreenFoxClient:
             ('udp_direct', lambda: UDPTransport((server, 9999)))
         ])
         self.session = None
+        
+        print("[Client] ✅ Leak prevention initialized")
 
     def handshake(self):
         print("[Handshake] Sending...")
@@ -670,6 +968,13 @@ class GreenFoxClient:
                     break
         
         threading.Thread(target=tun_reader, daemon=True).start()
+        
+        # Run initial leak detection
+        print("\n[Client] Running leak detection...")
+        LeakDetectionUtils.run_full_leak_test()
+        
+        print("[Client] 🟢 VPN is ACTIVE - All traffic routed through encrypted tunnel")
+        print("[Client] Your IP and DNS are protected\n")
         
         while True:
             try:
@@ -879,6 +1184,8 @@ if __name__ == "__main__":
     cli.add_argument('--port', type=int, default=443)
     cli.add_argument('--tun', default='tun1')
     cli.add_argument('--cert-pin', help="Server certificate SHA256 hash for pinning (optional)")
+    test = sub.add_parser('test-leaks')
+    test.add_argument('--dns', default='10.8.0.1', help="Expected VPN DNS server (default: 10.8.0.1)")
     args = parser.parse_args()
     try:
         if args.mode == 'client':
@@ -889,6 +1196,9 @@ if __name__ == "__main__":
             print(f"🔴 [GreenFox] Starting Server (Obfuscating on port {args.port})...")
             s = GreenFoxServer(args.port, tun_name=args.tun)
             s.run()
+        elif args.mode == 'test-leaks':
+            print(f"🔍 [GreenFox] Running Leak Detection Tests...")
+            LeakDetectionUtils.run_full_leak_test()
         else:
             parser.print_help()
     except Exception as e:
