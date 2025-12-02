@@ -129,13 +129,19 @@ def set_dns_linux(dns='1.1.1.1'):
         pass
 
 def tun_alloc(dev='tun0', auto_up=False, ip=None):
-    if not os.path.exists('/dev/net/tun'): sys.exit(1)
+    if not os.path.exists('/dev/net/tun'):
+        raise RuntimeError("TUN device /dev/net/tun not found. Are you running on Linux with tun/tap support and sufficient privileges?")
     tun = os.open('/dev/net/tun', os.O_RDWR)
     ifr = struct.pack('16sH', dev.encode(), IFF_TUN | IFF_NO_PI)
     try:
         import fcntl
         fcntl.ioctl(tun, TUNSETIFF, ifr)
-    except OSError: sys.exit(1)
+    except OSError as e:
+        try:
+            os.close(tun)
+        except Exception:
+            pass
+        raise RuntimeError(f"Failed to allocate TUN device {dev}: {e}. Are you running as root?")
     if auto_up and ip:
         subprocess.run(['ip', 'addr', 'add', ip, 'dev', dev], check=False)
         subprocess.run(['ip', 'link', 'set', dev, 'mtu', str(TUN_MTU)], check=False)
@@ -540,28 +546,27 @@ class GreenFoxServer:
 if __name__ == "__main__":
     parser = ArgumentParser(description="GreenFox VPN Protocol v3.0 (Anti-Censorship)")
     sub = parser.add_subparsers(dest='mode')
-    
     srv = sub.add_parser('server')
     srv.add_argument('--port', type=int, default=443)
     srv.add_argument('--tun', default='tun0')
-    
     cli = sub.add_parser('client')
     cli.add_argument('server', help="Server IP or Hostname (for TLS)")
     cli.add_argument('server_pub_hex', help="X25519 Pub Key Hex")
     cli.add_argument('--server_ecdsa_pub', help="Path to ECDSA pub key (optional)")
     cli.add_argument('--port', type=int, default=443)
     cli.add_argument('--tun', default='tun1')
-
     args = parser.parse_args()
-
-    if args.mode == 'client':
-        print(f"🟢 [GreenFox] Starting Client (Anti-Censorship Mode)...")
-        c = GreenFoxClient(args.server, args.port, args.server_pub_hex, args.server_ecdsa_pub, tun_name=args.tun)
-        c.run()
-            
-    elif args.mode == 'server':
-        print(f"🔴 [GreenFox] Starting Server (Obfuscating on port {args.port})...")
-        s = GreenFoxServer(args.port, tun_name=args.tun)
-        s.run()
-    else:
-        parser.print_help()
+    try:
+        if args.mode == 'client':
+            print(f"🟢 [GreenFox] Starting Client (Anti-Censorship Mode)...")
+            c = GreenFoxClient(args.server, args.port, args.server_pub_hex, args.server_ecdsa_pub, tun_name=args.tun)
+            c.run()
+        elif args.mode == 'server':
+            print(f"🔴 [GreenFox] Starting Server (Obfuscating on port {args.port})...")
+            s = GreenFoxServer(args.port, tun_name=args.tun)
+            s.run()
+        else:
+            parser.print_help()
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
