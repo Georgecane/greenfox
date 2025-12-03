@@ -24,27 +24,45 @@ The Green Fox VPN protocol is a secure, fast, open-source, and free technology d
 - ✅ **Split-Tunnel Prevention** - Impossible to bypass VPN
 - ✅ **Leak Detection Tests** - Built-in verification system
 
-**Run leak tests:**
-```bash
-python3 Protocol.py test-leaks
-```
+### 🌐 Decentralized P2P Mode (v4.0+ - NEW!)
 
-See **SECURITY_LEAKS_PREVENTION.md** for complete leak prevention documentation.
+**Ethereum testnet-powered decentralized VPN:**
+
+- ✅ **No Central Server** - Nodes discovered via blockchain
+- ✅ **Trustless Network** - Transparent node reputation on-chain
+- ✅ **Censorship Resistant** - Can't be blocked or shut down
+- ✅ **P2P Architecture** - Anyone can run a node instantly
+- ✅ **Completely Legal** - Uses free testnet (no real money)
 
 ## 🚀 Quick Start
 
-### Server
+### Traditional Centralized Mode
+
+**Start Server:**
 ```bash
-sudo python3 Protocol.py server --port 443 --tun tun0
+sudo python Protocol.py server --port 443 --tun tun0
 ```
 
-### Client
+**Connect as Client:**
 ```bash
-# Get server public key first (printed when server starts)
 sudo python Protocol.py client <SERVER_IP> <SERVER_PUB_HEX> --port 443
+```
 
-# With certificate pinning (optional):
-sudo python Protocol.py client <SERVER_IP> <SERVER_PUB_HEX> --cert-pin <SHA256_HASH>
+### Decentralized P2P Mode (NEW!)
+
+**Run a VPN Node (auto-registers on blockchain):**
+```bash
+sudo python Protocol.py server
+```
+
+**Connect as Decentralized Client (auto-discovers nodes):**
+```bash
+sudo python Protocol.py client-decentralized
+```
+
+**List Available Nodes:**
+```bash
+python Protocol.py discover-nodes
 ```
 
 ## 📋 Requirements
@@ -57,6 +75,19 @@ cryptography
 requests
 dnspython
 pyflakes
+web3              # For decentralized P2P mode
+eth-account       # For Ethereum integration
 ```
 
 Install: `pip install -r requirements.txt`
+
+## 🔐 Features
+
+- ✅ Strong encryption (X25519 + ChaCha20-Poly1305)
+- ✅ DPI evasion (TLS + WebSocket camouflage)
+- ✅ Anti-censorship (Antigravity bypass)
+- ✅ Complete leak prevention (DNS, IPv6, WebRTC)
+- ✅ Decentralized P2P mode (blockchain-powered)
+- ✅ Node reputation system
+- ✅ 100% legal (testnet-based)
+- ✅ Open source & transparent

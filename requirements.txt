@@ -5,3 +5,5 @@ cryptography
 requests
 dnspython
 pyflakes
+web3
+eth-account
